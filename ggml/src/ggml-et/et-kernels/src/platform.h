@@ -109,6 +109,112 @@ static inline int get_num_threads(uint64_t shire_mask) {
 #define CLEAR_TENSOR_ERROR     __asm__ __volatile__ ( "csrwi 0x808, 0" : : );
 
 //******************************************************************************
+// L2 Scratchpad (SCP) Addressing
+//
+// Format 0 (bit[30]=0): direct address into a specific shire's L2 SCP.
+//   shire: 0-33 for explicit shire, L2SCP_SHIRE_LOCAL (0x7F) for local
+//   offset: byte offset within the shire's scratchpad
+//
+// Shire ID 0x7F always targets the local shire (instead of figuring out which
+// shire you are on).
+//******************************************************************************
+
+#define L2SCP_BASE        0x0080000000ULL
+#define L2SCP_SHIRE_LOCAL 0x7FULL
+
+static inline void * __attribute__((always_inline)) et_shire_l2scp(uint64_t shire, uint64_t offset) {
+    return (void *) (L2SCP_BASE | ((shire & 0x7F) << 23) | (offset & 0x7FFFFF));
+}
+
+// Local shire shorthand - no cross-shire traffic.
+static inline void * __attribute__((always_inline)) et_shire_l2scp_local(uint64_t offset) {
+    return (void *) (L2SCP_BASE | (L2SCP_SHIRE_LOCAL << 23) | (offset & 0x7FFFFF));
+}
+
+//******************************************************************************
+// Cache Operations
+//******************************************************************************
+
+// Flush nlines cache lines at stride apart starting at addr from L1 to L2 via
+// FlushVA (CSR 0x8BF). Needed before a tensor_load/tensor_load_setup_b reads
+// data a hart just wrote with ordinary stores: tensor loads bypass L1 and
+// read from L2/memory directly, so a write sitting only in L1 is invisible to
+// them without this. Caller must FENCE before and WAIT_CACHEOPS after.
+//
+// NOTE: nlines is encoded in a 4-bit field (max 16). DO NOT pass nlines > 16.
+static inline void __attribute__((always_inline)) flush_to_l2(const void * addr, uint64_t nlines, uint64_t stride) {
+    uint64_t csr_val = (0x1ULL << 58) | ((uint64_t) addr & 0xFFFFFFFFFFC0ULL) | ((nlines - 1) & 0xF);
+    uint64_t x31_val = stride & 0xFFFFFFFFFFC0ULL;
+
+    __asm__ __volatile__(
+        "mv x31, %[x31]\n"
+        "csrw 0x8BF, %[val]\n"
+        :
+        : [x31] "r"(x31_val), [val] "r"(csr_val)
+        : "x31", "memory");
+}
+
+// Flush an arbitrary number of lines to L2, working around the 16-line cap of
+// a single FlushVA by issuing multiple flushes.
+static inline void __attribute__((always_inline)) flush_to_l2_multi(const void * addr, uint64_t nlines, uint64_t stride) {
+    const char * p = (const char *) addr;
+    while (nlines > 16) {
+        flush_to_l2(p, 16, stride);
+        p += 16 * stride;
+        nlines -= 16;
+    }
+    if (nlines) {
+        flush_to_l2(p, nlines, stride);
+    }
+}
+
+// Evict nlines cache lines at stride apart starting at addr from L1 to L2.
+// Uses EvictVA (CSR 0x89F). Unlike flush_to_l2, this guarantees the line is
+// NOT present in L1 after the operation - subsequent loads will miss and go
+// to L2/SCP. Caller must FENCE before and WAIT_CACHEOPS after.
+//
+// NOTE: nlines is encoded in a 4-bit field (max 16). DO NOT pass nlines > 16.
+static inline void __attribute__((always_inline)) evict_to_l2(const void * addr, uint64_t nlines, uint64_t stride) {
+    uint64_t csr_val = (0x1ULL << 58) | ((uint64_t) addr & 0xFFFFFFFFFFC0ULL) | ((nlines - 1) & 0xF);
+    uint64_t x31_val = stride & 0xFFFFFFFFFFC0ULL;
+
+    __asm__ __volatile__(
+        "mv x31, %[x31]\n"
+        "csrw 0x89F, %[val]\n"
+        :
+        : [x31] "r"(x31_val), [val] "r"(csr_val)
+        : "x31", "memory");
+}
+
+//******************************************************************************
+// Counter signaling between harts via L2 scratchpad (SCP)
+//
+// Used by a dual-hart producer/consumer pipeline: hart 1 dequantizes weight
+// blocks into L2 SCP while hart 0 drives the tensor engine off the same
+// scratch. Both counters live in L2 SCP so they are visible across harts once
+// evicted from L1.
+//******************************************************************************
+
+// Signal a counter value to the other hart via L2 SCP.
+static inline void __attribute__((always_inline))
+scp_signal(volatile uint32_t *flag, uint32_t value) {
+    *flag = value;
+    FENCE;
+    evict_to_l2((const void *)flag, 1, 64);
+    WAIT_CACHEOPS;
+}
+
+// Wait for a counter in L2 SCP to reach the expected value.
+static inline void __attribute__((always_inline))
+scp_wait(volatile uint32_t *flag, uint32_t expected) {
+    while (1) {
+        evict_to_l2((const void *)flag, 1, 64);
+        WAIT_CACHEOPS;
+        if (*flag >= expected) return;
+    }
+}
+
+//******************************************************************************
 // L1 Data Cache / Scratchpad (SCP) Configuration
 //
 // The ET-SoC-1 L1 data cache can be split so that half its ways operate as a
