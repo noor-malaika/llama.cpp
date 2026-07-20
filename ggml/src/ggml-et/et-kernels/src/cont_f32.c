@@ -74,7 +74,40 @@ int entry_point(struct ggml_et_cont_params* params, void* env) {
         return 0;
     }
 
-    // Iterate over source tensor dimensions
+    // Fast path: source row is itself contiguous (nb00 == sizeof(float)) and a
+    // multiple of 8 wide, e.g. a CONT that only permutes/collapses the outer
+    // dims (attention V-transpose / head-merge before the output projection).
+    // dst is always fully contiguous and rows are partitioned disjointly
+    // across threads, so no atomics are needed here - copy 8 floats per
+    // vector load/store instead of one scalar atomic store per element.
+    const bool row_contiguous = (nb00 == (int64_t) sizeof(float)) && (ne00 % 8 == 0);
+
+    if (row_contiguous) {
+        for (int64_t i03 = 0; i03 < ne03; i03++) {
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                const int64_t dst_linear_base = i03 * ne02 * ne01 * ne00 + i02 * ne01 * ne00;
+
+                for (int64_t i01 = start_row; i01 < end_row; i01++) {
+                    const int64_t dst_linear_row_base = dst_linear_base + i01 * ne00;
+                    const int64_t src_row_bytes = i01*nb01 + i02*nb02 + i03*nb03;
+                    const float* src_row = (const float*)((const char*)src0_data + src_row_bytes);
+                    float* dst_row = &dst_data[dst_linear_row_base];
+
+                    for (int64_t i00 = 0; i00 < ne00; i00 += 8) {
+                        __asm__ volatile(
+                            "flw.ps f10, %[x]\n"
+                            "fsw.ps f10, %[y]\n"
+                            : [y] "=m"(*(float (*)[8]) &dst_row[i00])
+                            : [x] "m"(*(const float (*)[8]) &src_row[i00])
+                            : "f10");
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    // General strided fallback (e.g. permutes that leave dim 0 non-contiguous).
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // Calculate base linear index for this (i03, i02) slice in destination
