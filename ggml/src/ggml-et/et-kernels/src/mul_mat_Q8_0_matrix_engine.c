@@ -42,7 +42,7 @@
 #define REUSE_MAX 15
 #endif
 #ifndef KWIN
-#define KWIN    16      // K-blocks per dequant window (cache depth)
+#define KWIN    32      // K-blocks per dequant window (cache depth)
 #endif
 
 #define MACHINE_SLOTS (NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE)  // 1024
