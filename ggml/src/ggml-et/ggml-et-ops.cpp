@@ -331,6 +331,10 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
 
         kernel_name = "mul_mat_Q8_0";  // N < 53, or M % 16 != 0, or K % 32 != 0
         src0_type_name = "Q8_0";
+        GGML_LOG_ERROR("DIAG mul_mat_Q8_0 shape: K=%lld M=%lld N=%lld ne02=%lld ne03=%lld ne12=%lld ne13=%lld\n",
+                (long long)node->src[0]->ne[0], (long long)node->src[0]->ne[1], (long long)node->src[1]->ne[1],
+                (long long)node->src[0]->ne[2], (long long)node->src[0]->ne[3],
+                (long long)node->src[1]->ne[2], (long long)node->src[1]->ne[3]);
 
     } else if (node->type == GGML_TYPE_F32 &&
                node->src[0]->type == GGML_TYPE_F16 &&
