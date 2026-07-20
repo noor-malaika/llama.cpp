@@ -58,6 +58,81 @@ static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks
     }
 }
 
+// Dot one Q8_0 weight row against 4 activation columns at once. The weight
+// row is the same for all 4 columns, so its per-block int8 gather + convert
+// (the actual "dequant" cost) is done ONCE per K-block and reused across all
+// 4 fmadd chains, instead of being redone from scratch for every column like
+// the single-column path below does. Activation loads still scale linearly
+// with N (unavoidable - each column's data genuinely differs), only the
+// weight-side work is amortized.
+static inline void
+dot_q8_0_row_n4(const block_q8_0* q_row, int64_t K_blocks,
+                 const float* b_col0, const float* b_col1,
+                 const float* b_col2, const float* b_col3,
+                 float out[4]) {
+    unsigned long temp_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(temp_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+    __asm__ volatile(
+        "fbci.pi f20, 0\n" "fbci.pi f21, 0\n"
+        "fbci.pi f22, 0\n" "fbci.pi f23, 0\n"
+        ::: "f20", "f21", "f22", "f23");
+
+    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    __asm__ volatile("flw.ps f31, %[gather]\n" : : [gather] "m"(*(const int32_t(*)[8])gather_pattern) : "f31");
+
+    for (int64_t kb = 0; kb < K_blocks; kb++) {
+        const block_q8_0* blk = q_row + kb;
+        const float scale = fp16_to_fp32(blk->d);
+        const int64_t off = kb << 5;
+
+        for (int chunk = 0; chunk < 4; chunk++) {
+            const int co = chunk << 3;
+            __asm__ volatile(
+                "fgb.ps   f11, f31(%[a_ptr])\n"   // gather 8 int8 weights (shared)
+                "fcvt.ps.pw f11, f11\n"           // -> float
+                "fbc.ps   f9, %[scale]\n"
+                "fmul.ps  f11, f11, f9\n"         // weight * block scale (shared)
+                "flw.ps   f12, %[b0]\n"
+                "fmadd.ps f20, f11, f12, f20\n"
+                "flw.ps   f12, %[b1]\n"
+                "fmadd.ps f21, f11, f12, f21\n"
+                "flw.ps   f12, %[b2]\n"
+                "fmadd.ps f22, f11, f12, f22\n"
+                "flw.ps   f12, %[b3]\n"
+                "fmadd.ps f23, f11, f12, f23\n"
+                :
+                : [a_ptr] "r"(&blk->qs[co]), [scale] "m"(scale),
+                  [b0] "m"(*(const float(*)[8])&b_col0[off + co]),
+                  [b1] "m"(*(const float(*)[8])&b_col1[off + co]),
+                  [b2] "m"(*(const float(*)[8])&b_col2[off + co]),
+                  [b3] "m"(*(const float(*)[8])&b_col3[off + co])
+                : "f9", "f11", "f12", "f20", "f21", "f22", "f23"
+            );
+        }
+    }
+
+#define HREDUCE(reg, dest)                                                   \
+    __asm__ __volatile__(                                                   \
+        "fswizz.ps f1, " #reg ", 0xB1 \n\t"                                 \
+        "fadd.ps   f2, " #reg ", f1, rne \n\t"                              \
+        "fswizz.ps f3, f2, 0x4E \n\t"                                       \
+        "fadd.ps   f4, f2, f3, rne \n\t"                                    \
+        "fmvz.x.ps t0, f4, 4 \n\t"                                          \
+        "fbcx.ps   f5, t0 \n\t"                                             \
+        "fadd.ps   %[vout], f4, f5, rne \n\t"                               \
+        : [vout] "=f"(dest)                                                 \
+        :: "t0", "f1", "f2", "f3", "f4", "f5")
+
+    HREDUCE(f20, out[0]);
+    HREDUCE(f21, out[1]);
+    HREDUCE(f22, out[2]);
+    HREDUCE(f23, out[3]);
+#undef HREDUCE
+
+    __asm__ volatile("mova.m.x %0" :: "r"(temp_mask));
+}
+
 int entry_point(struct ggml_et_binary_params* params, void* env) {
     uint64_t hart_id = get_hart_id();
     const int64_t stride_m = 2048;
@@ -103,22 +178,41 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-            for (int64_t n = 0; n < N; n++) {
-                // src1 is F32, so column pointer moves by nb11
+            const int64_t n4_end = N - (N % 4);
+
+            // Main path: 4 activation columns per weight row, so each Q8_0
+            // block's int8 gather+convert is done once and reused 4x instead
+            // of once per column (see dot_q8_0_row_n4 above).
+            for (int64_t n = 0; n < n4_end; n += 4) {
+                const float* b_col0 = (const float*)(src1_ptr2 + (n + 0) * nb11);
+                const float* b_col1 = (const float*)(src1_ptr2 + (n + 1) * nb11);
+                const float* b_col2 = (const float*)(src1_ptr2 + (n + 2) * nb11);
+                const float* b_col3 = (const float*)(src1_ptr2 + (n + 3) * nb11);
+
+                for (int64_t m = hart_id; m < M; m += stride_m) {
+                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+                    float sums[4];
+                    dot_q8_0_row_n4(q_row, K_blocks, b_col0, b_col1, b_col2, b_col3, sums);
+
+                    for (int c = 0; c < 4; c++) {
+                        float* dst_entry = (float*)(dst_ptr2 + (n + c) * nbd1 + m * sizeof(float));
+                        atomic_store_f32((volatile float*)dst_entry, sums[c]);
+                    }
+                }
+            }
+
+            // Tail: N % 4 leftover columns, original single-column path.
+            for (int64_t n = n4_end; n < N; n++) {
                 const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
                 for (int64_t m = hart_id; m < M; m += stride_m) {
-                    // src0 is Q8_0 blocks, row pointer moves by nb01
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
                     float sum = 0.0f;
 
                     for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
                         sum += compute_block_dot_product_q8_0(q_row + kb, b_col_base + (kb << 5));
                     }
 
-                    // Store result in dst[m, n, i2, i3]
                     float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
                     atomic_store_f32((volatile float*)dst_entry, sum);
                 }
