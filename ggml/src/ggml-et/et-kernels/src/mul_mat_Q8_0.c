@@ -9,6 +9,7 @@
 #include "math_fp.h"
 #include "quants.h"
 #include "block_ops.h"
+#include "tensor.h"
 
 // Using the block prefetch logic
 static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks, uint32_t worker_id) {
@@ -91,6 +92,52 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
+    // Stage the activation vector (src1) into per-shire L2 SCP once per call,
+    // so every one of up to M rows' dot product reads it from on-chip memory
+    // instead of re-fetching it from DRAM. Decode's B is small (N=1, K up to
+    // 8192 => <=32KB) and every row's dot product re-reads all of it, so
+    // without staging, streaming the (large) weight matrix through cache
+    // repeatedly evicts this small, reused vector between rows. Only applies
+    // to the common no-broadcast case (matches every per-layer projection and
+    // lm_head; matmul_id / batched-broadcast shapes fall back to the
+    // untouched direct-DRAM-read path below).
+    //
+    // NOTE (unverified as of this port): et_tensor_load_l2scp is declared in
+    // tensor.h and used by no other kernel in this tree currently - there is
+    // no proven mainline call site to confirm its prerequisites against, only
+    // this port's own source (an unmerged branch, itself never board-verified
+    // as far as this repo's history shows). First thing to sanity-check once
+    // hardware is available again.
+    const int      b_contig = (nb11 == (size_t) K * sizeof(float));
+    const uint64_t b_lines  = ((uint64_t) N * K * sizeof(float) + 63) / 64;
+    const int      stage_b  = b_contig && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+                              b_lines <= 8192;  // <= 512 KB, within the per-shire SCP budget
+    const float * b_scp = (const float *) et_shire_l2scp_local(0);
+
+    if (stage_b) {
+        if ((hart_id & 63) == 0) {
+            et_tensor_load_l2scp_conf_t conf;
+            conf.use_tmask = false;
+            conf.stride    = 64;
+            uint64_t remaining = b_lines;
+            uint64_t dst_ln    = 0;
+            uint64_t addr      = (uint64_t) params->src1.data;
+            while (remaining > 0) {
+                uint64_t cl = (remaining >= 16) ? 16 : remaining;
+                conf.dst_start = dst_ln;
+                conf.addr      = addr;
+                conf.num_lines = cl - 1;   // 4-bit field encodes (lines - 1)
+                conf.id        = 0;
+                et_tensor_load_l2scp(&conf);
+                WAIT_TENSOR_LOAD_L2_0;
+                dst_ln    += cl;
+                addr      += cl * 64;
+                remaining -= cl;
+            }
+        }
+        et_barrier(ET_BARRIER_SHIRE);   // B is now resident in L2 SCP for every hart in this shire
+    }
+
     for (int64_t i3 = 0; i3 < ne13; i3++) {
         const int64_t i03 = i3 / r3;
         const char* src0_ptr3 = (const char*)params->src0.data + i03 * nb03;
@@ -104,8 +151,12 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
             for (int64_t n = 0; n < N; n++) {
-                // src1 is F32, so column pointer moves by nb11
-                const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
+                // src1 is F32, so column pointer moves by nb11. If staged,
+                // read from on-chip L2 SCP instead (laid out as N contiguous
+                // rows of K floats each, written by the staging loop above).
+                const float* b_col_base = stage_b
+                    ? (b_scp + n * K)
+                    : (const float*)(src1_ptr2 + n * nb11);
 
                 for (int64_t m = hart_id; m < M; m += stride_m) {
                     // src0 is Q8_0 blocks, row pointer moves by nb01
