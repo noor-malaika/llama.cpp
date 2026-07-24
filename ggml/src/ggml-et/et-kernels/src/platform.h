@@ -206,13 +206,23 @@ static inline void atomic_store_f16(volatile uint16_t* addr, uint16_t value) {
     );
 }
 
-// Minion-scope barrier: syncs both harts within a minion (FLB=minion_id, FCC 0). Only scope currently in use.
+// Barrier scopes: MINION syncs both harts within a minion (FLB=minion_id,
+// FCC 0). SHIRE syncs all harts across one shire (FLB=0, FCC 1) - used when a
+// single hart per shire stages shared data (e.g. into L2 SCP) and every hart
+// in that shire must wait for it before reading the staged data.
 typedef enum {
     ET_BARRIER_MINION,
+    ET_BARRIER_SHIRE,
 } et_barrier_scope_t;
 
 static inline uint64_t __attribute__((always_inline)) et_barrier(et_barrier_scope_t scope) {
-    (void) scope;
+    if (scope == ET_BARRIER_SHIRE) {
+        // Master shire has only 16 minions (32 harts), others have 32 (64 harts).
+        uint64_t shire_id     = get_shire_id();
+        uint32_t thread_count = (shire_id == SHIRE_MASTER) ? 32 : 64;
+        uint32_t mask         = (shire_id == SHIRE_MASTER) ? 0xFFFF0000U : 0xFFFFFFFFU;
+        return shire_barrier(0, 1, thread_count, mask, mask);
+    }
     uint32_t local_minion = (get_hart_id() >> 1) & 0x1F;
     uint32_t mask         = 1u << local_minion;
     return shire_barrier(local_minion, 0, 2, mask, mask);
