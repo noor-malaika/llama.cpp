@@ -213,6 +213,35 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                         dst_block[j] = results[j];
                     }
                 }
+
+                // Lever D: harts that own no block (hart_id >= num_blocks)
+                // are otherwise fully idle for the whole call. That only
+                // matters when a call has more than one round of blocks per
+                // active hart (num_blocks > stride_m, i.e. M > stride_m*16 -
+                // in practice only lm_head, M=128256). For every smaller
+                // per-layer matmul num_blocks <= stride_m, there's no second
+                // round for anyone, and every idle hart below simply finds
+                // its condition false and returns - a genuine no-op, not
+                // just "probably harmless".
+                //
+                // Scope, stated honestly: a full weight row here is
+                // K_blocks*sizeof(block_q8_0) bytes (e.g. ~2176B/~34 cache
+                // lines for K=2048) - far more than a couple of prefetch
+                // instructions can cover. This does NOT attempt to stage a
+                // whole future block; it issues one 16-line prefetch against
+                // the start of the *first* row of the block an active hart
+                // will reach on its second pass, giving that hart's own
+                // per-row prefetching (q8_0_dot_tile's PF_AHEAD) a head
+                // start instead of a cold first access. A partial warm-up,
+                // not full coverage - real value unknown until measured.
+                if (hart_id >= num_blocks && hart_id < stride_m) {
+                    const int64_t owner        = hart_id - num_blocks;
+                    const int64_t second_block = owner + stride_m;
+                    if (owner < num_blocks && second_block < num_blocks) {
+                        const int64_t m0 = second_block * BLOCK_ROWS;
+                        l2_prefetch(src0_ptr2 + m0 * nb01, 16, 64);
+                    }
+                }
             }
         }
     }
