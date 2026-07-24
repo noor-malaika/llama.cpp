@@ -315,9 +315,24 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
     const char* kernel_name;
     const char* src0_type_name;
 
+    // Lever E: route Q8_0 through the tensor-engine matrix kernel at every N,
+    // including N=1 decode - not just N>=47 prefill/batch shapes. Previously
+    // gated at N>=47 (kept below, commented, as the pre-lever-E behavior).
+    // This is safe to attempt at all: the kernel's own tiling already clamps
+    // partial N-tiles (n_cur = min(TILE_N, N-nb), see mul_mat_Q8_0_matrix_engine.c),
+    // and its ru_n/reuse_ok logic already degrades to a single-tile
+    // "ORIGINAL path" when n_tiles==1 - i.e. N=1 was already a structurally
+    // supported case in that kernel, just never reachable because of this
+    // gate. Whether it's actually *faster* than the scalar path at N=1 is
+    // the open question this branch exists to test - there's real prior
+    // precedent both ways on this hardware (Rehan Qasim's landed F32
+    // matrix-engine kernel has no N floor at all and is presumably a win;
+    // an earlier Q4_0 matrix-engine exploration found N<53 lost to scalar
+    // and explicitly routed those cases back to vecdot). Q8_0 has never
+    // been tried at N=1 as far as this repo's history shows.
     if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_Q8_0 &&
         node->src[1]->type == GGML_TYPE_F32 &&
-        node->src[1]->ne[1] >= 47 &&      // N >= 47
+        // node->src[1]->ne[1] >= 47 &&    // pre-lever-E gate, N >= 47
         node->src[0]->ne[1] % 16 == 0 &&  // M % TILE_M
         node->src[0]->ne[0] % 32 == 0) {  // K % BLOCK_K (Q8_0 block)
 
@@ -328,7 +343,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
                node->src[0]->type == GGML_TYPE_Q8_0 &&
                node->src[1]->type == GGML_TYPE_F32) {
 
-        kernel_name    = "mul_mat_Q8_0";  // N < 47, or M % 16 != 0 or K % 32 != 0
+        kernel_name    = "mul_mat_Q8_0";  // M % 16 != 0 or K % 32 != 0 (lever E: N no longer a factor here)
         src0_type_name = "Q8_0";
 
     } else if (node->type == GGML_TYPE_F32 &&
