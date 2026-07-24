@@ -108,11 +108,40 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     // this port's own source (an unmerged branch, itself never board-verified
     // as far as this repo's history shows). First thing to sanity-check once
     // hardware is available again.
+    // Reserve the first 4KB of this shire's L2 SCP for lever C2's per-group
+    // coordination scratch (see below) so the two levers' scratch usage can
+    // never collide when stacked together. Real per-shire SCP capacity is
+    // NOT documented anywhere found in this repo (project notes record a
+    // prior hard crash - garbage stream-sync errors, not a clean failure -
+    // from a different kernel exceeding it); this reservation is a
+    // known-safe-relative-to-lever-A-alone shift, not proof the combined
+    // footprint fits real hardware. Board-verify before trusting.
+    #define LEVER_C2_SCRATCH_BYTES 4096
+
     const int      b_contig = (nb11 == (size_t) K * sizeof(float));
     const uint64_t b_lines  = ((uint64_t) N * K * sizeof(float) + 63) / 64;
     const int      stage_b  = b_contig && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
-                              b_lines <= 8192;  // <= 512 KB, within the per-shire SCP budget
-    const float * b_scp = (const float *) et_shire_l2scp_local(0);
+                              b_lines <= 8128;  // <= 508 KB, leaves room for the 4KB reservation above
+    const float * b_scp = (const float *) et_shire_l2scp_local(LEVER_C2_SCRATCH_BYTES);
+
+    // Lever C2 group-coordination scratch: 4 groups of 16 harts per shire
+    // (64 harts/shire / 16), each group gets 16 slots of 64B (one per
+    // group member - result float at offset 0, "ready" flag at offset 4,
+    // rest padding). One slot per cache line so 16 different harts writing
+    // their own slot concurrently never share a line - the same
+    // false-sharing hazard this whole file exists to remove would otherwise
+    // just move into the coordination mechanism itself.
+    void * c2_scratch_base = et_shire_l2scp_local(0);
+
+    if ((hart_id & 63) == 0) {
+        // Zero the whole reserved region once per call, before anyone reads
+        // or writes a flag - piggybacks on the shire barrier below instead
+        // of needing a separate one.
+        volatile uint32_t * z = (volatile uint32_t *) c2_scratch_base;
+        for (uint64_t i = 0; i < LEVER_C2_SCRATCH_BYTES / sizeof(uint32_t); i++) {
+            z[i] = 0;
+        }
+    }
 
     if (stage_b) {
         if ((hart_id & 63) == 0) {
@@ -135,8 +164,20 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 remaining -= cl;
             }
         }
-        et_barrier(ET_BARRIER_SHIRE);   // B is now resident in L2 SCP for every hart in this shire
     }
+    // Shire barrier covers both: staged B (if any) and the zeroed C2
+    // scratch are both visible to every hart in the shire past this point.
+    et_barrier(ET_BARRIER_SHIRE);
+
+    // C2 only activates when every hart in every 16-hart group has the same
+    // trip count through the m-loop below (M % 16 == 0) - guarantees no
+    // group member is ever missing when the leader waits for all 16 flags.
+    // This model's actual shapes (2048/8192/128256, all multiples of 16)
+    // always satisfy this; falls back to the plain atomic store otherwise.
+    const int c2_active = (M % 16) == 0;
+    const int c2_local_idx = (int) (hart_id % 16);   // 0 = leader of its group
+    char * c2_group_scratch = (char *) c2_scratch_base +
+        (uint64_t) ((hart_id % 64) / 16) * (16 * 64);
 
     // Vector mask (all 8 lanes) is the same for every block of every row of
     // the whole call - set it once here instead of once per block inside the
@@ -176,9 +217,81 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                     }
                     float sum = q8_0_dot_reduce();
 
-                    // Store result in dst[m, n, i2, i3]
-                    float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
-                    atomic_store_f32((volatile float*)dst_entry, sum);
+                    if (!c2_active) {
+                        // Fallback: plain per-row atomic store (identical to
+                        // lever B's behavior), used whenever group trip
+                        // counts aren't guaranteed equal.
+                        float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
+                        atomic_store_f32((volatile float*)dst_entry, sum);
+                        continue;
+                    }
+
+                    // Lever C2: full 2048-way compute parallelism kept (every
+                    // hart still computes exactly one row, same as lever B) -
+                    // only the final write is rerouted through this group's
+                    // scratch so only the leader (local_idx==0) ever touches
+                    // the real dst array, once per group, with a plain store.
+                    char * my_slot          = c2_group_scratch + c2_local_idx * 64;
+                    float * my_result_slot  = (float *) my_slot;
+                    volatile uint32_t * my_flag = (volatile uint32_t *) (my_slot + 4);
+
+                    // Wait for the PREVIOUS round's leader to have consumed
+                    // and cleared this slot before overwriting it (double
+                    // handshake - without this, a fast hart could reach its
+                    // next iteration's write before the leader finishes
+                    // reading the current one). No-op on the first
+                    // iteration since the zeroing above already left every
+                    // flag at 0.
+                    while (*my_flag != 0) {
+                        evict_to_l2((const void *) my_flag, 1, 64);
+                        WAIT_CACHEOPS;
+                        FENCE;
+                    }
+
+                    *my_result_slot = sum;
+                    FENCE;
+                    *my_flag = 1;
+                    FENCE;
+                    evict_to_l2((const void *) my_slot, 1, 64);
+                    WAIT_CACHEOPS;
+                    FENCE;
+
+                    if (c2_local_idx == 0) {
+                        for (int j = 1; j < 16; j++) {
+                            volatile uint32_t * flag_j =
+                                (volatile uint32_t *) (c2_group_scratch + j * 64 + 4);
+                            while (*flag_j == 0) {
+                                evict_to_l2((const void *) flag_j, 1, 64);
+                                WAIT_CACHEOPS;
+                                FENCE;
+                            }
+                        }
+
+                        const int64_t group_m0   = m;   // leader's own m == group start
+                        const int64_t rows_here  = (group_m0 + 16 <= M) ? 16 : (M - group_m0);
+                        float results[16];
+                        for (int j = 0; j < rows_here; j++) {
+                            results[j] = *(float *) (c2_group_scratch + j * 64);
+                        }
+
+                        // Sole writer to this dst range for this group - plain store.
+                        float* dst_block = (float*)(dst_ptr2 + n * nbd1 + group_m0 * sizeof(float));
+                        for (int j = 0; j < rows_here; j++) {
+                            dst_block[j] = results[j];
+                        }
+
+                        // Clear all 16 flags, releasing every group member
+                        // (including this leader) to write the next round.
+                        for (int j = 0; j < 16; j++) {
+                            volatile uint32_t * flag_j =
+                                (volatile uint32_t *) (c2_group_scratch + j * 64 + 4);
+                            *flag_j = 0;
+                        }
+                        FENCE;
+                        evict_to_l2((const void *) c2_group_scratch, 16, 64);
+                        WAIT_CACHEOPS;
+                        FENCE;
+                    }
                 }
             }
         }
