@@ -165,20 +165,53 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                     ? (b_scp + n * K)
                     : (const float*)(src1_ptr2 + n * nb11);
 
-                for (int64_t m = hart_id; m < M; m += stride_m) {
-                    // src0 is Q8_0 blocks, row pointer moves by nb01
-                    const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+                // Cache-line-owned block store (lever C1). Rows are dealt out
+                // in contiguous 16-row blocks (64B = one cache line of dst
+                // floats) instead of round-robin single rows, so each active
+                // hart owns an entire block exclusively - no other hart ever
+                // writes into that 64B range. That means the final write can
+                // be a plain store instead of atomic_store_f32: the atomic
+                // was only ever needed because round-robin assignment put up
+                // to 16 different harts' single-row writes into the same
+                // cache line concurrently (see mul_mat_Q8_0's git history /
+                // project notes for the full false-sharing analysis).
+                //
+                // Trade-off: this activates far fewer harts (ceil(M/16)
+                // instead of up to M), each doing 16x the sequential
+                // dot-product work. Whether removing the atomic is worth
+                // that lost parallelism is exactly what needs a board number
+                // - this is genuinely unverified, not a ported/proven
+                // pattern (no other kernel in this tree drops atomics this
+                // way; cont_f32.c's cache-line-distributed path still loops
+                // atomic_store_f32 per element even though its distribution
+                // is already collision-free).
+                const int64_t BLOCK_ROWS = 16;   // 64B cache line / sizeof(float)
+                const int64_t num_blocks = (M + BLOCK_ROWS - 1) / BLOCK_ROWS;
 
-                    q8_0_dot_reset();
-                    for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // b_col is float*, so a block (32 elements) moves by (kb << 5)
-                        q8_0_dot_tile(q_row, b_col_base + (kb << 5), kb, K_blocks);
+                for (int64_t block = hart_id; block < num_blocks; block += stride_m) {
+                    const int64_t m0        = block * BLOCK_ROWS;
+                    const int64_t rows_here = (m0 + BLOCK_ROWS <= M) ? BLOCK_ROWS : (M - m0);
+
+                    float results[BLOCK_ROWS];
+                    for (int64_t j = 0; j < rows_here; j++) {
+                        const int64_t m = m0 + j;
+                        // src0 is Q8_0 blocks, row pointer moves by nb01
+                        const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
+
+                        q8_0_dot_reset();
+                        for (int64_t kb = 0; kb < K_blocks; kb++) {
+                            // b_col is float*, so a block (32 elements) moves by (kb << 5)
+                            q8_0_dot_tile(q_row, b_col_base + (kb << 5), kb, K_blocks);
+                        }
+                        results[j] = q8_0_dot_reduce();
                     }
-                    float sum = q8_0_dot_reduce();
 
-                    // Store result in dst[m, n, i2, i3]
-                    float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
-                    atomic_store_f32((volatile float*)dst_entry, sum);
+                    // This hart exclusively owns dst rows [m0, m0+rows_here)
+                    // for this (n, i2, i3) - plain store, no atomic needed.
+                    float* dst_block = (float*)(dst_ptr2 + n * nbd1 + m0 * sizeof(float));
+                    for (int64_t j = 0; j < rows_here; j++) {
+                        dst_block[j] = results[j];
+                    }
                 }
             }
         }
