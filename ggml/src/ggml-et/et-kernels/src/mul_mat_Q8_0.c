@@ -138,6 +138,13 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
         et_barrier(ET_BARRIER_SHIRE);   // B is now resident in L2 SCP for every hart in this shire
     }
 
+    // Vector mask (all 8 lanes) is the same for every block of every row of
+    // the whole call - set it once here instead of once per block inside the
+    // dot product (q8_0_dot_tile no longer touches it).
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
     for (int64_t i3 = 0; i3 < ne13; i3++) {
         const int64_t i03 = i3 / r3;
         const char* src0_ptr3 = (const char*)params->src0.data + i03 * nb03;
@@ -161,13 +168,13 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 for (int64_t m = hart_id; m < M; m += stride_m) {
                     // src0 is Q8_0 blocks, row pointer moves by nb01
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
-                    float sum = 0.0f;
 
+                    q8_0_dot_reset();
                     for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
-                        sum += compute_block_dot_product_q8_0(q_row + kb, b_col_base + (kb << 5));
+                        // b_col is float*, so a block (32 elements) moves by (kb << 5)
+                        q8_0_dot_tile(q_row, b_col_base + (kb << 5), kb, K_blocks);
                     }
+                    float sum = q8_0_dot_reduce();
 
                     // Store result in dst[m, n, i2, i3]
                     float* dst_entry = (float*)(dst_ptr2 + n * nbd1 + m * sizeof(float));
@@ -176,5 +183,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
             }
         }
     }
+
+    __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
     return 0;
 }
