@@ -47,6 +47,7 @@ struct ggml_et_mm_q8_params {
     ggml_tensor dst;
     ggml_tensor bias;
     int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
+    int32_t prefetch_dest;  // cache-op destination: 0 = L1, 1 = L2
 };
 
 // Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).
@@ -58,11 +59,18 @@ struct ggml_et_mm_q8_ffn_params {
     ggml_tensor act;   // F32  [K, N] shared activation
     ggml_tensor dst;   // F32  [n_ff, N]
     int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
+    int32_t prefetch_dest;  // cache-op destination: 0 = L1, 1 = L2
 };
 
 // Rows of Q8_0 weights each hart prefetches ahead of the row it is computing,
 // from GGML_ET_PREFETCH_ROWS. 0 (default) disables prefetching entirely.
 int32_t ggml_et_prefetch_rows();
+
+// Cache level prefetched weight rows land in: 0 = L1, 1 = L2 (default).
+// Both our -9% result and DarthCeltic's -3.3% (PR #170) prefetched to L2;
+// each hart owns whole rows, so there is no sharing that justifies stopping
+// short of L1. GGML_ET_PREFETCH_DEST selects it.
+int32_t ggml_et_prefetch_dest();
 
 // Element map parameters for embarrassingly parallel binary operations (MUL, ADD, etc.)
 // Operation type is determined by dst->op (GGML_OP_MUL, GGML_OP_ADD, etc.)

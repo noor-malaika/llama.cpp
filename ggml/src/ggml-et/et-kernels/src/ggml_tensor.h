@@ -223,6 +223,7 @@ struct ggml_et_mm_q8_params {
     struct ggml_tensor dst;
     struct ggml_tensor bias;
     int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
+    int32_t prefetch_dest;  // cache-op destination: 0 = L1, 1 = L2
 };
 
 // Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).
@@ -235,6 +236,7 @@ struct ggml_et_mm_q8_ffn_params {
     struct ggml_tensor act;   // F32  [K, N]    -- shared activation
     struct ggml_tensor dst;   // F32  [n_ff, N]
     int32_t prefetch_rows;    // weight rows to prefetch ahead; 0 disables
+    int32_t prefetch_dest;    // cache-op destination: 0 = L1, 1 = L2
 };
 
 // MUL_MAT_ID operation parameters (Mixture of Experts)

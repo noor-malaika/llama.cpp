@@ -188,6 +188,17 @@ int32_t ggml_et_prefetch_rows() {
     return rows;
 }
 
+int32_t ggml_et_prefetch_dest() {
+    static const int32_t dest = [] {
+        const char * v = getenv("GGML_ET_PREFETCH_DEST");
+        if (!v || !v[0]) {
+            return 1;  // L2, matching the original hardcoded behaviour
+        }
+        return atoi(v) == 0 ? 0 : 1;
+    }();
+    return dest;
+}
+
 // Mirrors the Q8_0 branch conditions in ggml_et_op_mul_mat below. Only the
 // scalar kernel reads the fused-bias slot; the matrix-engine variant ignores it,
 // so fusing while that one is selected would silently drop the residual.
@@ -527,6 +538,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         q8_params.src1                 = params.src1;
         q8_params.dst                  = params.dst;
         q8_params.prefetch_rows        = ggml_et_prefetch_rows();
+        q8_params.prefetch_dest        = ggml_et_prefetch_dest();
         kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &q8_params, sizeof(q8_params), mm_shire_mask);
     } else {
         kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
@@ -609,6 +621,7 @@ bool ggml_et_op_mul_mat_add(ggml_backend_et_device_context* dev_ctx,
     q8_params.dst  = *add_node;              // write straight to the ADD output
     q8_params.bias = *addend;
     q8_params.prefetch_rows = ggml_et_prefetch_rows();
+    q8_params.prefetch_dest = ggml_et_prefetch_dest();
 
     // The kernel indexes bias with dst's strides, so the caller guarantees they
     // match (checked in ggml_et_can_fuse before we get here).
@@ -644,6 +657,7 @@ bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
     params.act  = *gate_node->src[1];  // F32  shared activation
     params.dst  = *glu_node;
     params.prefetch_rows = ggml_et_prefetch_rows();
+    params.prefetch_dest = ggml_et_prefetch_dest();
 
     const uint64_t shire_mask = ggml_et_shire_mask_for(gate_node->src[0]->ne[1]);
 

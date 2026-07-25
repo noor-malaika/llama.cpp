@@ -10,19 +10,28 @@
 #include "quants.h"
 #include "block_ops.h"
 
-// Pull a byte range into L2 for the calling hart.
+// Pull a byte range into L1 or L2 for the calling hart, ahead of use.
 //
-// Decode is latency-bound, not bandwidth-bound: measured 19.7 GB/s against a
-// ~68 GB/s DDR peak. Each hart walks its weight row as a dependent
-// load -> dot -> accumulate chain, so an in-order minion stalls on every miss
-// with nothing else in flight. Issuing the row this hart will need *next*
-// while it computes the current one gives the memory system a full row of
-// lead time. Unlike prefetch_weight_row() below, this covers a single hart's
-// own row -- there is no cross-hart split, because each hart owns whole rows.
-static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes) {
+// Each hart walks its weight row as a dependent load -> dot -> accumulate
+// chain, so an in-order minion stalls on every miss with nothing else in
+// flight. Issuing the row this hart needs *next* while it computes the current
+// one gives the memory system a full row of lead time. Unlike
+// prefetch_weight_row() below, this covers a single hart's own row -- there is
+// no cross-hart split, because each hart owns whole rows.
+//
+// Prefetching to L2 measured as a regression: -9% here, and -3.3%
+// independently in DarthCeltic's PR #170. Both prefetched to L2. Since each
+// hart owns whole rows there is nothing shared to justify stopping at L2, so
+// the destination is now selectable and L1 is untested -- see
+// GGML_ET_PREFETCH_DEST. Default (1 = L2) reproduces the old behaviour.
+static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes, int32_t dest) {
     if (num_bytes <= 0) {
         return;
     }
+    // Destination field is bits 59:58 of the CSR operand: 0 = L1, 1 = L2.
+    // Each hart owns whole rows here, so nothing is shared between harts and
+    // stopping at L2 only adds an L2->L1 hop on every line.
+    const uint64_t dest_bits = (dest == 0) ? 0ull : (1ull << 58);
     uintptr_t ptr     = (uintptr_t)start_ptr & ~(uintptr_t)63;
     uintptr_t end_ptr = (uintptr_t)start_ptr + (uintptr_t)num_bytes;
     int64_t   lines   = (int64_t)(((end_ptr - ptr) + 63) >> 6);
@@ -31,14 +40,13 @@ static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes) {
     while (lines > 0) {
         const uint64_t batch = (uint64_t)((lines > 16 ? 16 : lines) - 1);
         __asm__ __volatile__ (
-            "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
             "addi  x31, zero, 64\n"           // Stride = 64 bytes
-            "or    x3, x1, %[ptr]\n"          // Combine Dest + VA
+            "or    x3, %[dst], %[ptr]\n"      // Combine Dest + VA
             "or    x3, x3, %[sz]\n"           // Combine with NumLines
             "csrw  0x81f, x3\n"               // prefetch_va
             :
-            : [ptr] "r" (ptr), [sz] "r" (batch)
-            : "x1", "x3", "x31", "memory"
+            : [ptr] "r" (ptr), [sz] "r" (batch), [dst] "r" (dest_bits)
+            : "x3", "x31", "memory"
         );
         ptr   += 16 * 64;
         lines -= 16;
@@ -147,6 +155,7 @@ int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
     // count rather than nb01 so a padded row stride never over-prefetches.
     const int64_t row_bytes      = K_blocks * (int64_t)sizeof(block_q8_0);
     const int32_t prefetch_rows  = params->prefetch_rows;
+    const int32_t prefetch_dest  = params->prefetch_dest;
 
     // Broadcasting ratios
     const int64_t r2 = ne12 / ne02;
@@ -172,7 +181,7 @@ int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
 
                 // Warm L2 with this hart's first row before the chain starts.
                 if (prefetch_rows > 0 && (int64_t)hart_id < M) {
-                    et_prefetch_range(src0_ptr2 + (int64_t)hart_id * nb01, row_bytes);
+                    et_prefetch_range(src0_ptr2 + (int64_t)hart_id * nb01, row_bytes, prefetch_dest);
                 }
 
                 for (int64_t m = hart_id; m < M; m += stride_m) {
@@ -180,7 +189,7 @@ int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
                     if (prefetch_rows > 0) {
                         const int64_t ahead = m + (int64_t)prefetch_rows * stride_m;
                         if (ahead < M) {
-                            et_prefetch_range(src0_ptr2 + ahead * nb01, row_bytes);
+                            et_prefetch_range(src0_ptr2 + ahead * nb01, row_bytes, prefetch_dest);
                         }
                     }
 

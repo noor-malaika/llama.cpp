@@ -22,10 +22,14 @@
 // Pull a byte range into L2 for the calling hart. Mirrors mul_mat_Q8_0.c; see
 // the rationale there. This kernel streams two weight rows per output element,
 // so it has twice the miss traffic to cover.
-static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes) {
+static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes, int32_t dest) {
     if (num_bytes <= 0) {
         return;
     }
+    // Destination field is bits 59:58 of the CSR operand: 0 = L1, 1 = L2.
+    // Each hart owns whole rows here, so nothing is shared between harts and
+    // stopping at L2 only adds an L2->L1 hop on every line.
+    const uint64_t dest_bits = (dest == 0) ? 0ull : (1ull << 58);
     uintptr_t ptr     = (uintptr_t)start_ptr & ~(uintptr_t)63;
     uintptr_t end_ptr = (uintptr_t)start_ptr + (uintptr_t)num_bytes;
     int64_t   lines   = (int64_t)(((end_ptr - ptr) + 63) >> 6);
@@ -33,14 +37,13 @@ static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes) {
     while (lines > 0) {
         const uint64_t batch = (uint64_t)((lines > 16 ? 16 : lines) - 1);
         __asm__ __volatile__ (
-            "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
             "addi  x31, zero, 64\n"           // Stride = 64 bytes
-            "or    x3, x1, %[ptr]\n"          // Combine Dest + VA
+            "or    x3, %[dst], %[ptr]\n"      // Combine Dest + VA
             "or    x3, x3, %[sz]\n"           // Combine with NumLines
             "csrw  0x81f, x3\n"               // prefetch_va
             :
-            : [ptr] "r" (ptr), [sz] "r" (batch)
-            : "x1", "x3", "x31", "memory"
+            : [ptr] "r" (ptr), [sz] "r" (batch), [dst] "r" (dest_bits)
+            : "x3", "x31", "memory"
         );
         ptr   += 16 * 64;
         lines -= 16;
@@ -113,14 +116,15 @@ int entry_point(struct ggml_et_mm_q8_ffn_params* params, void* env) {
 
     const int64_t row_bytes     = K_blocks * (int64_t)sizeof(block_q8_0);
     const int32_t prefetch_rows = params->prefetch_rows;
+    const int32_t prefetch_dest = params->prefetch_dest;
 
     for (int64_t n = 0; n < N; n++) {
         const float* act_col = (const float*)(act_data + n * nba1);
 
         // Warm L2 with this hart's first pair of rows before the chain starts.
         if (prefetch_rows > 0 && hart_id < M) {
-            et_prefetch_range(gate_data + hart_id * nbg1, row_bytes);
-            et_prefetch_range(up_data   + hart_id * nbu1, row_bytes);
+            et_prefetch_range(gate_data + hart_id * nbg1, row_bytes, prefetch_dest);
+            et_prefetch_range(up_data   + hart_id * nbu1, row_bytes, prefetch_dest);
         }
 
         for (int64_t m = hart_id; m < M; m += stride_m) {
@@ -128,8 +132,8 @@ int entry_point(struct ggml_et_mm_q8_ffn_params* params, void* env) {
             if (prefetch_rows > 0) {
                 const int64_t ahead = m + (int64_t)prefetch_rows * stride_m;
                 if (ahead < M) {
-                    et_prefetch_range(gate_data + ahead * nbg1, row_bytes);
-                    et_prefetch_range(up_data   + ahead * nbu1, row_bytes);
+                    et_prefetch_range(gate_data + ahead * nbg1, row_bytes, prefetch_dest);
+                    et_prefetch_range(up_data   + ahead * nbu1, row_bytes, prefetch_dest);
                 }
             }
 
