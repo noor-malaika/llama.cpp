@@ -169,6 +169,11 @@ bool ggml_et_fuse_ffn_enabled() {
     return enabled;
 }
 
+bool ggml_et_fuse_attn_enabled() {
+    static const bool enabled = ggml_et_env_flag_default_on("GGML_ET_FUSE_ATTN");
+    return enabled;
+}
+
 // Default off: prefetching is a pure experiment until the board says otherwise,
 // and a wrong distance can evict the row being consumed.
 int32_t ggml_et_prefetch_rows() {
@@ -647,6 +652,59 @@ bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
 
     ET_PERF_END_EXT("FFN_GLU", "mul_mat_Q8_0_ffn_glu", glu_node, "n_ff=%" PRId64,
                     gate_node->src[0]->ne[1]);
+    return kernel_result;
+}
+
+// Fused decode attention: MUL_MAT(k,q) + SOFT_MAX + MUL_MAT(v,kq) + CONT in a
+// single launch. The four ops together do only tens of microseconds of work
+// but cost four ~110 us launches, so this is close to pure overhead removal.
+bool ggml_et_op_attn_decode(ggml_backend_et_device_context* dev_ctx,
+                            const ggml_tensor* kq_node,
+                            const ggml_tensor* softmax_node,
+                            const ggml_tensor* kqv_node,
+                            const ggml_tensor* cont_node) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !kq_node || !softmax_node || !kqv_node || !cont_node) {
+        GGML_LOG_ERROR("ET: Invalid parameters for fused attention\n");
+        return false;
+    }
+
+    const ggml_tensor* k = kq_node->src[0];   // F16 [head_dim, n_kv, n_kv_head]
+    const ggml_tensor* q = kq_node->src[1];   // F32 [head_dim, n_tokens, n_head]
+    const ggml_tensor* v = kqv_node->src[0];  // F16 [n_kv, head_dim, n_kv_head]
+
+    if (!k || !q || !v) {
+        GGML_LOG_ERROR("ET: fused attention missing operands\n");
+        return false;
+    }
+
+    // soft_max_ext packs scale then max_bias into op_params.
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (const float*) softmax_node->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float*) softmax_node->op_params + 1, sizeof(float));
+
+    ggml_et_attn_params params = {};
+    params.q = *q;
+    params.k = *k;
+    params.v = *v;
+    if (softmax_node->src[1]) {
+        params.mask = *softmax_node->src[1];
+    } else {
+        memset(&params.mask, 0, sizeof(params.mask));  // kernel skips the add
+    }
+    params.dst   = *cont_node;
+    params.scale = scale;
+
+    // One work unit per (head, token).
+    const uint64_t shire_mask = ggml_et_shire_mask_for(q->ne[2] * q->ne[1]);
+
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "attn_decode_f16",
+                                               &params, sizeof(params), shire_mask);
+
+    ET_PERF_END_EXT("ATTN_DECODE", "attn_decode_f16", cont_node,
+                    "n_head=%" PRId64 "|n_kv=%" PRId64, q->ne[2], k->ne[1]);
     return kernel_result;
 }
 

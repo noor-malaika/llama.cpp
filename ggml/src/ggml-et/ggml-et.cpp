@@ -533,6 +533,116 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     abort();
 }
 
+// View-only ops occupy a node slot but compute nothing.
+static inline bool ggml_et_op_is_view(enum ggml_op op) {
+    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_NONE;
+}
+
+// Match the decode attention subgraph and return the index of its CONT node,
+// or -1. The pattern is
+//
+//   MUL_MAT(k, q) -> SOFT_MAX(mask) -> MUL_MAT(v, kq) -> [PERMUTE] -> CONT
+//
+// PERMUTE is a view, so it sits in the node list as a no-op and the five nodes
+// are not a contiguous op sequence -- ggml_can_fuse() cannot express this.
+// ggml_can_fuse_subgraph_ext() takes explicit indices, so the empty nodes are
+// stepped over here and the real ops are handed to it for the use-count check
+// that proves the three intermediates die inside the subgraph.
+static int ggml_et_match_attn_decode(const struct ggml_cgraph * cgraph, int i) {
+    if (!ggml_et_fuse_attn_enabled()) {
+        return -1;
+    }
+    if (i + 3 >= cgraph->n_nodes) {
+        return -1;
+    }
+
+    const ggml_tensor * kq = cgraph->nodes[i];
+    const ggml_tensor * sm = cgraph->nodes[i + 1];
+    const ggml_tensor * kqv = cgraph->nodes[i + 2];
+
+    if (kq->op != GGML_OP_MUL_MAT || sm->op != GGML_OP_SOFT_MAX || kqv->op != GGML_OP_MUL_MAT) {
+        return -1;
+    }
+    if (sm->src[0] != kq || kqv->src[1] != sm) {
+        return -1;
+    }
+
+    // Walk past view-only nodes to the CONT that lays kqv back out.
+    int j = i + 3;
+    while (j < cgraph->n_nodes && ggml_et_op_is_view(cgraph->nodes[j]->op)) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_CONT) {
+        return -1;
+    }
+
+    // The CONT must actually consume kqv (through the views).
+    const ggml_tensor * src = cgraph->nodes[j]->src[0];
+    while (src && src != kqv && src->view_src) {
+        src = src->view_src;
+    }
+    if (src != kqv) {
+        return -1;
+    }
+
+    const ggml_tensor * k = kq->src[0];
+    const ggml_tensor * q = kq->src[1];
+    const ggml_tensor * v = kqv->src[0];
+    if (!k || !q || !v) {
+        return -1;
+    }
+
+    // Decode only. One hart owns a whole (head, token) pair, so a long prefill
+    // would serialise n_kv x head_dim on each hart and lose to the unfused path.
+    if (q->ne[1] != 1 || q->ne[3] != 1) {
+        return -1;
+    }
+
+    if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        q->type != GGML_TYPE_F32 || cgraph->nodes[j]->type != GGML_TYPE_F32) {
+        return -1;
+    }
+
+    // The kernel indexes v as [n_kv, head_dim] (the transposed cache layout).
+    if (v->ne[0] != k->ne[1] || v->ne[1] != k->ne[0]) {
+        return -1;
+    }
+
+    // head_dim must keep each hart's 64 output floats on private cache lines.
+    if (q->ne[0] != k->ne[0] || (q->ne[0] * sizeof(float)) % 64 != 0) {
+        return -1;
+    }
+    if (q->ne[0] > 128) {
+        return -1;  // matches ATTN_MAX_HEAD_DIM in the kernel
+    }
+
+    // Grouped-query heads must divide evenly.
+    if (k->ne[2] <= 0 || q->ne[2] % k->ne[2] != 0) {
+        return -1;
+    }
+
+    // ALiBi slopes and attention sinks are not implemented in the fused kernel.
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f || sm->src[2]) {
+        return -1;
+    }
+    if (sm->src[1] && (sm->src[1]->type != GGML_TYPE_F32 || sm->src[1]->ne[1] < q->ne[1])) {
+        return -1;
+    }
+
+    // Confirm the intermediates are dead outside the group.
+    const int idxs[3] = { i, i + 1, i + 2 };
+    const enum ggml_op ops[3] = { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+    const int outputs[1] = { 2 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops, outputs, 1)) {
+        return -1;
+    }
+
+    return j;
+}
+
 static bool ggml_et_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
                              std::initializer_list<enum ggml_op> ops) {
     // ggml_can_fuse() requires a chain -- each node a src of the next. The
@@ -695,6 +805,18 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
             ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);
             i++;  // skip the MUL node
             continue;
+        }
+
+        // Fused decode attention: MUL_MAT + SOFT_MAX + MUL_MAT + CONT -> 1 launch.
+        {
+            const int cont_idx = ggml_et_match_attn_decode(cgraph, i);
+            if (cont_idx >= 0) {
+                if (ggml_et_op_attn_decode(dev_ctx, node, cgraph->nodes[i + 1],
+                                           cgraph->nodes[i + 2], cgraph->nodes[cont_idx])) {
+                    i = cont_idx;
+                    continue;
+                }
+            }
         }
 
         // ffn_gate and ffn_up are independent, so they are not each other's src

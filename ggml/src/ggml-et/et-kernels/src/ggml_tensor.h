@@ -237,6 +237,18 @@ struct ggml_et_mm_q8_ffn_params {
     int32_t prefetch_rows;    // weight rows to prefetch ahead; 0 disables
 };
 
+// Fused decode attention: dst = softmax(q.K * scale + mask) . V, laid out
+// straight into the CONT output. Must stay layout-identical to
+// ggml_et_attn_params in ggml-et-ops.h.
+struct ggml_et_attn_params {
+    struct ggml_tensor q;     // F32 [head_dim, n_tokens, n_head]
+    struct ggml_tensor k;     // F16 [head_dim, n_kv,     n_kv_head]
+    struct ggml_tensor v;     // F16 [n_kv,     head_dim, n_kv_head] (transposed)
+    struct ggml_tensor mask;  // F32 [n_kv_pad, n_tokens]; data may be NULL
+    struct ggml_tensor dst;   // F32 [head_dim*n_head, n_tokens]
+    float scale;
+};
+
 // MUL_MAT_ID operation parameters (Mixture of Experts)
 struct ggml_et_mul_mat_id_params {
     struct ggml_tensor src0;  // Expert weight matrices [K, M, n_expert]

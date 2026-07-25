@@ -64,6 +64,17 @@ struct ggml_et_mm_q8_ffn_params {
 // from GGML_ET_PREFETCH_ROWS. 0 (default) disables prefetching entirely.
 int32_t ggml_et_prefetch_rows();
 
+// Fused decode attention. Must stay layout-identical to ggml_et_attn_params
+// in et-kernels/src/ggml_tensor.h.
+struct ggml_et_attn_params {
+    ggml_tensor q;     // F32 [head_dim, n_tokens, n_head]
+    ggml_tensor k;     // F16 [head_dim, n_kv,     n_kv_head]
+    ggml_tensor v;     // F16 [n_kv,     head_dim, n_kv_head] (transposed)
+    ggml_tensor mask;  // F32 [n_kv_pad, n_tokens]; data may be NULL
+    ggml_tensor dst;   // F32 [head_dim*n_head, n_tokens]
+    float scale;
+};
+
 // Element map parameters for embarrassingly parallel binary operations (MUL, ADD, etc.)
 // Operation type is determined by dst->op (GGML_OP_MUL, GGML_OP_ADD, etc.)
 struct ggml_et_elmap_params {
@@ -206,6 +217,15 @@ bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
                                 const ggml_tensor* gate_node,
                                 const ggml_tensor* up_node,
                                 const ggml_tensor* glu_node);
+bool ggml_et_fuse_attn_enabled();
+
+// dst = softmax(q.K*scale + mask) . V for a single decode token, in one
+// launch, replacing MUL_MAT + SOFT_MAX + MUL_MAT + CONT.
+bool ggml_et_op_attn_decode(ggml_backend_et_device_context* dev_ctx,
+                            const ggml_tensor* kq_node,
+                            const ggml_tensor* softmax_node,
+                            const ggml_tensor* kqv_node,
+                            const ggml_tensor* cont_node);
 bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_rope(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_rms_norm(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);

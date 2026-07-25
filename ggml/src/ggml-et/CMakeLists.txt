@@ -36,6 +36,7 @@ set(KERNELS
     mul_mat_Q8_0
     mul_mat_Q8_0_matrix_engine
     mul_mat_Q8_0_ffn_glu
+    attn_decode_f16
     mul_mat_f16
     rope_f32
     norm_f32
