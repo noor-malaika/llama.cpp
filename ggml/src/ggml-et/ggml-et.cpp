@@ -535,7 +535,16 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
 
 static bool ggml_et_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
                              std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+    // ggml_can_fuse() requires a chain -- each node a src of the next. The
+    // gate/up/GLU pattern is a diamond, not a chain, so the caller validates it
+    // with ggml_can_fuse_subgraph() and only the ET-specific edge and layout
+    // checks below apply.
+    const bool is_ffn_glu = ops.size() == 3 &&
+                            ops.begin()[0] == GGML_OP_MUL_MAT &&
+                            ops.begin()[1] == GGML_OP_MUL_MAT &&
+                            ops.begin()[2] == GGML_OP_GLU;
+
+    if (!is_ffn_glu && !ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
 
@@ -577,6 +586,97 @@ static bool ggml_et_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
         }
     }
 
+    if (ops.size() == 2 &&
+        ops.begin()[0] == GGML_OP_MUL_MAT &&
+        ops.begin()[1] == GGML_OP_ADD) {
+
+        if (!ggml_et_fuse_mm_add_enabled()) {
+            return false;
+        }
+
+        const ggml_tensor * mm  = cgraph->nodes[node_idx];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+
+        // Only the scalar Q8_0 kernel honours the fused-bias slot.
+        if (!ggml_et_mul_mat_is_scalar_q8(mm)) {
+            return false;
+        }
+
+        const ggml_tensor * addend = (add->src[0] == mm) ? add->src[1] : add->src[0];
+        if (!addend || addend == mm) {
+            return false;
+        }
+
+        if (add->type != GGML_TYPE_F32 || addend->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // The kernel addresses bias with dst's own strides, so shape and layout
+        // must match exactly -- this rules out any broadcasting ADD.
+        if (!ggml_are_same_shape(add, addend) || !ggml_are_same_stride(add, addend)) {
+            return false;
+        }
+        if (!ggml_is_contiguous(add) || !ggml_is_contiguous(addend)) {
+            return false;
+        }
+    }
+
+    if (ops.size() == 3 &&
+        ops.begin()[0] == GGML_OP_MUL_MAT &&
+        ops.begin()[1] == GGML_OP_MUL_MAT &&
+        ops.begin()[2] == GGML_OP_GLU) {
+
+        if (!ggml_et_fuse_ffn_enabled()) {
+            return false;
+        }
+
+        if (node_idx + 2 >= cgraph->n_nodes) {
+            return false;
+        }
+
+        const ggml_tensor * a   = cgraph->nodes[node_idx];
+        const ggml_tensor * b   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+
+        // Both projections must be the GLU's two operands, in either emission
+        // order -- which of them is the gate is decided by glu->src[0], not by
+        // graph position. The handler resolves it the same way.
+        const bool edges_ok = (glu->src[0] == a && glu->src[1] == b) ||
+                              (glu->src[0] == b && glu->src[1] == a);
+        if (!edges_ok) {
+            return false;
+        }
+
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+            return false;
+        }
+
+        // Both projections must take the same activation and identical weight
+        // geometry, and must route to the scalar Q8_0 kernel.
+        if (a->src[1] != b->src[1]) {
+            return false;
+        }
+        if (!ggml_et_mul_mat_is_scalar_q8(a) || !ggml_et_mul_mat_is_scalar_q8(b)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, glu)) {
+            return false;
+        }
+        if (a->src[0]->ne[0] != b->src[0]->ne[0] ||
+            a->src[0]->ne[1] != b->src[0]->ne[1]) {
+            return false;
+        }
+        if (a->src[0]->ne[0] % 32 != 0) {
+            return false;  // Q8_0 block size
+        }
+        if (!ggml_is_contiguous(glu) || !ggml_is_contiguous(a->src[1])) {
+            return false;
+        }
+        if (glu->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -594,6 +694,24 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);
             i++;  // skip the MUL node
+            continue;
+        }
+
+        // ffn_gate and ffn_up are independent, so they are not each other's src
+        // and ggml_can_fuse does not apply. ggml_can_fuse_subgraph checks instead
+        // that both projections are consumed only by the GLU, which is what makes
+        // it safe to skip writing them out.
+        if (i + 2 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { 2 }) &&
+            ggml_et_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+            ggml_et_op_mul_mat_ffn_glu(dev_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            i += 2;  // skip the second MUL_MAT and the GLU
+            continue;
+        }
+
+        if (ggml_et_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            ggml_et_op_mul_mat_add(dev_ctx, node, cgraph->nodes[i + 1]);
+            i++;  // skip the ADD node
             continue;
         }
 

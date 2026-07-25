@@ -143,6 +143,50 @@ static int64_t ggml_et_cacheline_units(const ggml_tensor * t) {
     return ((int64_t) ggml_nbytes(t) + 63) / 64;
 }
 
+// ---------------------------------------------------------------------------
+// Fusion gates
+//
+// Decode issues roughly nineteen kernel launches per layer, and per-launch cost
+// is the larger half of the token. These two fusions remove four of them:
+// MUL_MAT+ADD collapses each residual add into the projection that feeds it,
+// and gate/up/GLU collapses the whole SwiGLU feed-forward into one launch.
+//
+// Each is independently switchable so one build can be swept across the
+// combinations on the board instead of needing a rebuild per configuration.
+// ---------------------------------------------------------------------------
+static bool ggml_et_env_flag_default_on(const char * name) {
+    const char * v = getenv(name);
+    return !(v && v[0] == '0');
+}
+
+bool ggml_et_fuse_mm_add_enabled() {
+    static const bool enabled = ggml_et_env_flag_default_on("GGML_ET_FUSE_MM_ADD");
+    return enabled;
+}
+
+bool ggml_et_fuse_ffn_enabled() {
+    static const bool enabled = ggml_et_env_flag_default_on("GGML_ET_FUSE_FFN");
+    return enabled;
+}
+
+// Mirrors the Q8_0 branch conditions in ggml_et_op_mul_mat below. Only the
+// scalar kernel reads the fused-bias slot; the matrix-engine variant ignores it,
+// so fusing while that one is selected would silently drop the residual.
+bool ggml_et_mul_mat_is_scalar_q8(const ggml_tensor* node) {
+    if (!node || !node->src[0] || !node->src[1]) {
+        return false;
+    }
+    if (node->type != GGML_TYPE_F32 ||
+        node->src[0]->type != GGML_TYPE_Q8_0 ||
+        node->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const bool matrix_engine = node->src[1]->ne[1] >= 47 &&
+                               node->src[0]->ne[1] % 16 == 0 &&
+                               node->src[0]->ne[0] % 32 == 0;
+    return !matrix_engine;
+}
+
 bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context* dev_ctx,
                              const ggml_tensor* rms_norm_node,
                              const ggml_tensor* mul_node) {
@@ -518,6 +562,74 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         ET_PERF_END_EXT("MUL_MAT", kernel_variant, node, "flops=%" PRId64,
                         total_flops);
     }
+    return kernel_result;
+}
+
+bool ggml_et_op_mul_mat_add(ggml_backend_et_device_context* dev_ctx,
+                            const ggml_tensor* mul_mat_node,
+                            const ggml_tensor* add_node) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !mul_mat_node || !add_node) {
+        GGML_LOG_ERROR("ET: Invalid parameters for fused MUL_MAT_ADD operation\n");
+        return false;
+    }
+
+    // The addend is whichever ADD operand is not the MUL_MAT result.
+    const ggml_tensor * addend = (add_node->src[0] == mul_mat_node)
+                               ? add_node->src[1] : add_node->src[0];
+    if (!addend) {
+        GGML_LOG_ERROR("ET: Fused MUL_MAT_ADD missing addend\n");
+        return false;
+    }
+
+    ggml_et_mm_q8_params q8_params = {};
+    q8_params.src0 = *mul_mat_node->src[0];  // Q8_0 weights
+    q8_params.src1 = *mul_mat_node->src[1];  // F32 activations
+    q8_params.dst  = *add_node;              // write straight to the ADD output
+    q8_params.bias = *addend;
+
+    // The kernel indexes bias with dst's strides, so the caller guarantees they
+    // match (checked in ggml_et_can_fuse before we get here).
+    const uint64_t shire_mask = ggml_et_shire_mask_for(mul_mat_node->src[0]->ne[1]);
+
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "mul_mat_Q8_0",
+                                               &q8_params, sizeof(q8_params), shire_mask);
+
+    ET_PERF_END_EXT("MUL_MAT_ADD", "mul_mat_Q8_0_fused_add", add_node, "M=%" PRId64,
+                    mul_mat_node->src[0]->ne[1]);
+    return kernel_result;
+}
+
+bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
+                                const ggml_tensor* mm_a,
+                                const ggml_tensor* mm_b,
+                                const ggml_tensor* glu_node) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !mm_a || !mm_b || !glu_node) {
+        GGML_LOG_ERROR("ET: Invalid parameters for fused FFN GLU operation\n");
+        return false;
+    }
+
+    // glu->src[0] is the operand silu() is applied to, regardless of which of the
+    // two projections the graph emitted first.
+    const ggml_tensor * gate_node = (glu_node->src[0] == mm_a) ? mm_a : mm_b;
+    const ggml_tensor * up_node   = (gate_node == mm_a) ? mm_b : mm_a;
+
+    ggml_et_mm_q8_ffn_params params = {};
+    params.gate = *gate_node->src[0];  // Q8_0 [K, n_ff], receives silu()
+    params.up   = *up_node->src[0];    // Q8_0 [K, n_ff]
+    params.act  = *gate_node->src[1];  // F32  shared activation
+    params.dst  = *glu_node;
+
+    const uint64_t shire_mask = ggml_et_shire_mask_for(gate_node->src[0]->ne[1]);
+
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "mul_mat_Q8_0_ffn_glu",
+                                               &params, sizeof(params), shire_mask);
+
+    ET_PERF_END_EXT("FFN_GLU", "mul_mat_Q8_0_ffn_glu", glu_node, "n_ff=%" PRId64,
+                    gate_node->src[0]->ne[1]);
     return kernel_result;
 }
 

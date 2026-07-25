@@ -58,7 +58,7 @@ static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks
     }
 }
 
-int entry_point(struct ggml_et_binary_params* params, void* env) {
+int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
     // Rows are dealt round-robin across the harts that were actually launched.
     // The stride used to be the constant 2048 (32 shires x 32 minions x 2 harts),
     // which silently required every launch to use all 32 shires. Deriving it from
@@ -100,6 +100,11 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     const size_t nbd2 = params->dst.nb[2];
     const size_t nbd3 = params->dst.nb[3];
 
+    // Fused residual add. The host sets bias only when it has verified that the
+    // addend has exactly the same shape and strides as dst, so the same index
+    // arithmetic addresses both. bias.data == NULL means a plain MUL_MAT.
+    const char* bias_data = (const char*)params->bias.data;
+
     // Q8_0 block size is 32
     const int64_t K_blocks = K / 32;
 
@@ -112,12 +117,14 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
         const char* src0_ptr3 = (const char*)params->src0.data + i03 * nb03;
         const char* src1_ptr3 = (const char*)params->src1.data + i3 * nb13;
         char* dst_ptr3       = (char*)params->dst.data + i3 * nbd3;
+        const char* bias_ptr3 = bias_data ? bias_data + i3 * nbd3 : 0;
 
         for (int64_t i2 = 0; i2 < ne12; i2++) {
             const int64_t i02 = i2 / r2;
             const char* src0_ptr2 = src0_ptr3 + i02 * nb02;
             const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
             char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
+            const char* bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbd2 : 0;
 
             for (int64_t n = 0; n < N; n++) {
                 // src1 is F32, so column pointer moves by nb11
@@ -132,6 +139,10 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                         // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
                         // b_col is float*, so we move 32 elements (kb << 5)
                         sum += compute_block_dot_product_q8_0(q_row + kb, b_col_base + (kb << 5));
+                    }
+
+                    if (bias_ptr2) {
+                        sum += *(const float*)(bias_ptr2 + n * nbd1 + m * sizeof(float));
                     }
 
                     // Store result in dst[m, n, i2, i3]

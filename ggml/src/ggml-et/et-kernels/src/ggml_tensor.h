@@ -224,6 +224,17 @@ struct ggml_et_mm_q8_params {
     struct ggml_tensor bias;
 };
 
+// Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).
+// Collapses ffn_gate MUL_MAT, ffn_up MUL_MAT and the GLU into one launch, and
+// keeps the two n_ff-sized intermediates in registers instead of writing them
+// out and reading them back.
+struct ggml_et_mm_q8_ffn_params {
+    struct ggml_tensor gate;  // Q8_0 [K, n_ff] -- operand that receives silu()
+    struct ggml_tensor up;    // Q8_0 [K, n_ff]
+    struct ggml_tensor act;   // F32  [K, N]    -- shared activation
+    struct ggml_tensor dst;   // F32  [n_ff, N]
+};
+
 // MUL_MAT_ID operation parameters (Mixture of Experts)
 struct ggml_et_mul_mat_id_params {
     struct ggml_tensor src0;  // Expert weight matrices [K, M, n_expert]

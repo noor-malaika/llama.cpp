@@ -48,6 +48,16 @@ struct ggml_et_mm_q8_params {
     ggml_tensor bias;
 };
 
+// Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).
+// Must stay layout-identical to ggml_et_mm_q8_ffn_params in
+// et-kernels/src/ggml_tensor.h.
+struct ggml_et_mm_q8_ffn_params {
+    ggml_tensor gate;  // Q8_0 [K, n_ff] -- operand that receives silu()
+    ggml_tensor up;    // Q8_0 [K, n_ff]
+    ggml_tensor act;   // F32  [K, N] shared activation
+    ggml_tensor dst;   // F32  [n_ff, N]
+};
+
 // Element map parameters for embarrassingly parallel binary operations (MUL, ADD, etc.)
 // Operation type is determined by dst->op (GGML_OP_MUL, GGML_OP_ADD, etc.)
 struct ggml_et_elmap_params {
@@ -170,6 +180,26 @@ bool ggml_et_op_mul(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* 
 bool ggml_et_op_add(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_sub(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
+
+// Fusion helpers. Both are runtime-gated (see ggml-et-ops.cpp) so a single build
+// can be measured with each fusion on or off.
+//
+// True when this MUL_MAT would be dispatched to the scalar Q8_0 kernel, which is
+// the only mul_mat kernel that honours the fused-bias slot.
+bool ggml_et_mul_mat_is_scalar_q8(const ggml_tensor* node);
+bool ggml_et_fuse_mm_add_enabled();
+bool ggml_et_fuse_ffn_enabled();
+
+// dst = (mul_mat_node) + addend, in one launch.
+bool ggml_et_op_mul_mat_add(ggml_backend_et_device_context* dev_ctx,
+                            const ggml_tensor* mul_mat_node,
+                            const ggml_tensor* add_node);
+
+// dst = silu(gate x act) * (up x act), in one launch.
+bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
+                                const ggml_tensor* gate_node,
+                                const ggml_tensor* up_node,
+                                const ggml_tensor* glu_node);
 bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_rope(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_rms_norm(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
