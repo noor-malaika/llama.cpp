@@ -46,6 +46,7 @@ struct ggml_et_mm_q8_params {
     ggml_tensor src1;
     ggml_tensor dst;
     ggml_tensor bias;
+    int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
 };
 
 // Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).
@@ -56,7 +57,12 @@ struct ggml_et_mm_q8_ffn_params {
     ggml_tensor up;    // Q8_0 [K, n_ff]
     ggml_tensor act;   // F32  [K, N] shared activation
     ggml_tensor dst;   // F32  [n_ff, N]
+    int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
 };
+
+// Rows of Q8_0 weights each hart prefetches ahead of the row it is computing,
+// from GGML_ET_PREFETCH_ROWS. 0 (default) disables prefetching entirely.
+int32_t ggml_et_prefetch_rows();
 
 // Element map parameters for embarrassingly parallel binary operations (MUL, ADD, etc.)
 // Operation type is determined by dst->op (GGML_OP_MUL, GGML_OP_ADD, etc.)

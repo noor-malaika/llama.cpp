@@ -19,6 +19,34 @@
 #include "quants.h"
 #include "block_ops.h"
 
+// Pull a byte range into L2 for the calling hart. Mirrors mul_mat_Q8_0.c; see
+// the rationale there. This kernel streams two weight rows per output element,
+// so it has twice the miss traffic to cover.
+static inline void et_prefetch_range(const void* start_ptr, int64_t num_bytes) {
+    if (num_bytes <= 0) {
+        return;
+    }
+    uintptr_t ptr     = (uintptr_t)start_ptr & ~(uintptr_t)63;
+    uintptr_t end_ptr = (uintptr_t)start_ptr + (uintptr_t)num_bytes;
+    int64_t   lines   = (int64_t)(((end_ptr - ptr) + 63) >> 6);
+
+    while (lines > 0) {
+        const uint64_t batch = (uint64_t)((lines > 16 ? 16 : lines) - 1);
+        __asm__ __volatile__ (
+            "li    x1, 0x400000000000000 \n"  // Dest = L2 (bits 59:58 = 01)
+            "addi  x31, zero, 64\n"           // Stride = 64 bytes
+            "or    x3, x1, %[ptr]\n"          // Combine Dest + VA
+            "or    x3, x3, %[sz]\n"           // Combine with NumLines
+            "csrw  0x81f, x3\n"               // prefetch_va
+            :
+            : [ptr] "r" (ptr), [sz] "r" (batch)
+            : "x1", "x3", "x31", "memory"
+        );
+        ptr   += 16 * 64;
+        lines -= 16;
+    }
+}
+
 // silu(x) = x / (1 + exp(-x)), guarded at the tails so exp() cannot overflow.
 // Same formulation as glu_f32.c's silu_f32 so the fused and unfused paths agree.
 static inline float ffn_silu_f32(float x) {
@@ -83,10 +111,28 @@ int entry_point(struct ggml_et_mm_q8_ffn_params* params, void* env) {
         return -1;
     }
 
+    const int64_t row_bytes     = K_blocks * (int64_t)sizeof(block_q8_0);
+    const int32_t prefetch_rows = params->prefetch_rows;
+
     for (int64_t n = 0; n < N; n++) {
         const float* act_col = (const float*)(act_data + n * nba1);
 
+        // Warm L2 with this hart's first pair of rows before the chain starts.
+        if (prefetch_rows > 0 && hart_id < M) {
+            et_prefetch_range(gate_data + hart_id * nbg1, row_bytes);
+            et_prefetch_range(up_data   + hart_id * nbu1, row_bytes);
+        }
+
         for (int64_t m = hart_id; m < M; m += stride_m) {
+            // Stay prefetch_rows iterations ahead on both weight streams.
+            if (prefetch_rows > 0) {
+                const int64_t ahead = m + (int64_t)prefetch_rows * stride_m;
+                if (ahead < M) {
+                    et_prefetch_range(gate_data + ahead * nbg1, row_bytes);
+                    et_prefetch_range(up_data   + ahead * nbu1, row_bytes);
+                }
+            }
+
             const block_q8_0* gate_row = (const block_q8_0*)(gate_data + m * nbg1);
             const block_q8_0* up_row   = (const block_q8_0*)(up_data   + m * nbu1);
 

@@ -95,9 +95,39 @@ bool ggml_et_load_kernel(ggml_backend_et_device_context* dev_ctx, const std::str
     }
 }
 
+// Upper bound on how many shires any launch may use, from GGML_ET_MAX_SHIRES.
+//
+// Every launch ends in a device-wide barrier (setBarrier(true) below), so the
+// cost of a launch has a component that scales with how many shires have to
+// rendezvous, independent of how much work each one does. Decode is nowhere
+// near bandwidth- or compute-bound, so trading harts for a cheaper barrier can
+// be a net win. Unset (or >= 32) keeps the previous behaviour exactly.
+static uint64_t ggml_et_shire_cap_mask() {
+    static const uint64_t cap = []() -> uint64_t {
+        const char* v = getenv("GGML_ET_MAX_SHIRES");
+        if (!v || !v[0]) {
+            return 0xFFFFFFFFull;
+        }
+        const int n = atoi(v);
+        if (n <= 0 || n >= 32) {
+            return 0xFFFFFFFFull;
+        }
+        return (1ull << n) - 1ull;
+    }();
+    return cap;
+}
+
 bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::string& kernel_name,
                           void* params, size_t params_size, uint64_t shire_mask, bool enable_print,
                           bool sync_error_check) {
+    // Kernels derive their thread count from the mask they were launched with,
+    // so narrowing it here redistributes work rather than dropping it. Never
+    // narrow to nothing.
+    shire_mask &= ggml_et_shire_cap_mask();
+    if (shire_mask == 0) {
+        shire_mask = 1;
+    }
+
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
     if (!runtime) {
         GGML_LOG_ERROR("ET: Runtime not available for kernel launch\n");
