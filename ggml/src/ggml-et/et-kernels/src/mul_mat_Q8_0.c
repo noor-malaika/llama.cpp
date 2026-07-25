@@ -59,8 +59,24 @@ static inline void prefetch_weight_row(const void* start_ptr, int64_t num_blocks
 }
 
 int entry_point(struct ggml_et_binary_params* params, void* env) {
-    uint64_t hart_id = get_hart_id();
-    const int64_t stride_m = 2048;
+    // Rows are dealt round-robin across the harts that were actually launched.
+    // The stride used to be the constant 2048 (32 shires x 32 minions x 2 harts),
+    // which silently required every launch to use all 32 shires. Deriving it from
+    // the mask instead lets a caller launch a small matmul on fewer shires without
+    // dropping rows; with the full mask this is still exactly 2048, so the default
+    // path is unchanged.
+    kernel_environment_t* kernel_env = (kernel_environment_t*)env;
+    if (!kernel_env) {
+        return -1;
+    }
+
+    const int thread_id = get_relative_thread_id(kernel_env->shire_mask);
+    if (thread_id < 0) {
+        return 0;  // this hart's shire is not part of the launch
+    }
+
+    const uint64_t hart_id  = (uint64_t)thread_id;
+    const int64_t  stride_m = get_num_threads(kernel_env->shire_mask);
 
     // Matrix dimensions
     const int64_t K    = params->src0.ne[0];

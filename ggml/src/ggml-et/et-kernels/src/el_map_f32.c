@@ -147,6 +147,62 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     // Calculate total number of rows (flatten dimensions 1,2,3)
     const int64_t total_rows = ne1 * ne2 * ne3;
 
+    bool cache_aligned = (dst->ne[0] % 16 == 0);
+    if(!cache_aligned) {
+        return 1;
+    }
+
+    // Row-per-thread leaves every hart but one idle when there are fewer rows than
+    // threads -- which is every residual add of a single-token decode step, where
+    // the tensor is [n_embd, 1, 1, 1]. Split that row across threads by cache line
+    // instead. Restricted to the plain elementwise case (no dim-0 broadcast, both
+    // operands and the destination contiguous with matching row strides) so the
+    // general broadcasting path below stays the one source of truth for everything
+    // else.
+    const int64_t elems_per_cl = 16;  // 64B cache line of F32
+    if (total_rows < num_threads &&
+        ne0 == ne10 && ne0 == ne00 &&
+        nb0 == sizeof(float) && nb00 == sizeof(float) && nb10 == sizeof(float) &&
+        nb1 == (size_t)ne0 * sizeof(float) &&
+        nb01 == (size_t)ne00 * sizeof(float) &&
+        nb11 == (size_t)ne10 * sizeof(float) &&
+        ne02 == ne2 && ne03 == ne3 && ne12 == ne2 && ne13 == ne3 &&
+        ne01 == ne1 && ne11 == ne1) {
+
+        const int64_t cls_per_row = ne0 / elems_per_cl;
+        const int64_t total_cls   = total_rows * cls_per_row;
+
+        const int64_t cls_per_thread = (total_cls + num_threads - 1) / num_threads;
+        int64_t cl_start = (int64_t)thread_id * cls_per_thread;
+        int64_t cl_end   = cl_start + cls_per_thread;
+        if (cl_end > total_cls) cl_end = total_cls;
+        if (cl_start >= total_cls) return 0;
+
+        for (int64_t cl = cl_start; cl < cl_end; cl++) {
+            const int64_t row = cl / cls_per_row;
+            const int64_t off = (cl % cls_per_row) * elems_per_cl;
+
+            float*       dst_block  = (float*)((char*)dst_data  + row * nb1)  + off;
+            const float* src0_block = (const float*)((const char*)src0_data + row * nb01) + off;
+            const float* src1_block = (const float*)((const char*)src1_data + row * nb11) + off;
+
+            switch (operation) {
+                case GGML_OP_MUL:
+                    block_mul_cache_aligned(dst_block, src0_block, src1_block, (int)elems_per_cl);
+                    break;
+                case GGML_OP_ADD:
+                    block_add_cache_aligned(dst_block, src0_block, src1_block, (int)elems_per_cl);
+                    break;
+                case GGML_OP_SUB:
+                    block_sub_cache_aligned(dst_block, src0_block, src1_block, (int)elems_per_cl);
+                    break;
+                default:
+                    return 1;
+            }
+        }
+        return 0;
+    }
+
     // Distribute rows across threads using ceiling division to handle remainder
     const int64_t rows_per_thread = (total_rows + num_threads - 1) / num_threads;
     const int64_t start_row = thread_id * rows_per_thread;
@@ -154,11 +210,6 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
 
     if (start_row >= total_rows) {
         return 0;
-    }
-
-    bool cache_aligned = (dst->ne[0] % 16 == 0);
-    if(!cache_aligned) {
-        return 1;
     }
 
     for (int64_t ir = start_row; ir < end_row; ir++) {

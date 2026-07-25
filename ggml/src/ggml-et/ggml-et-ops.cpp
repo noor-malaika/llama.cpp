@@ -3,6 +3,9 @@
 #include "ggml-et-cpu-compare.h"
 #include "ggml-impl.h"
 
+#include <cstdlib>
+#include <cstring>
+
 // CPU comparison configuration - can be enabled for debugging
 static ggml_et_cpu_compare_config rope_cpu_compare_config = {
     /* .enabled = */ false,
@@ -84,6 +87,62 @@ static ggml_et_cpu_compare_config set_rows_cpu_compare_config = {
     /* .max_log_elements = */ 2048
 };
 
+// ---------------------------------------------------------------------------
+// Launch geometry
+//
+// Every kernel here has historically been launched on all 32 shires. The small
+// per-token ops of a decode step cannot use them: each kernel splits its work
+// into units (rows, cache lines, attention heads) and derives its thread count
+// from env->shire_mask, so a shire holding no work unit contributes nothing but
+// still has to be dispatched to and collected from at the launch barrier.
+//
+// ggml_et_shire_mask_for() clamps the mask to the shires that actually receive
+// a work unit. It never removes a shire that would have had work, so kernel
+// results are bit-identical -- only idle shires disappear.
+//
+// GGML_ET_LAUNCH_GEOMETRY=0 restores the unconditional 32-shire launch so a
+// single build can measure both settings without a rebuild.
+// ---------------------------------------------------------------------------
+#define SOC_MINIONS_PER_SHIRE_HOST 32
+#define NUM_HARTS_PER_MINION_HOST  2
+#define ET_MAX_SHIRES              32
+#define ET_ALL_SHIRES              0xFFFFFFFFull
+
+static bool ggml_et_launch_geometry_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_ET_LAUNCH_GEOMETRY");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
+// work_units: the number of independent pieces the kernel will hand to threads.
+// Must match that kernel's own splitting rule, otherwise shires with real work
+// would be dropped.
+static uint64_t ggml_et_shire_mask_for(int64_t work_units) {
+    if (!ggml_et_launch_geometry_enabled() || work_units <= 0) {
+        return ET_ALL_SHIRES;
+    }
+
+    const int64_t harts_per_shire = SOC_MINIONS_PER_SHIRE_HOST * NUM_HARTS_PER_MINION_HOST;
+    int64_t shires = (work_units + harts_per_shire - 1) / harts_per_shire;
+
+    if (shires >= ET_MAX_SHIRES) {
+        return ET_ALL_SHIRES;
+    }
+    if (shires < 1) {
+        shires = 1;
+    }
+    // Contiguous mask from bit 0: get_relative_thread_id() bases its numbering
+    // on the lowest set bit, so the active harts stay densely numbered from 0.
+    return (1ull << shires) - 1ull;
+}
+
+// Cache-line work units for kernels that split a contiguous byte range.
+static int64_t ggml_et_cacheline_units(const ggml_tensor * t) {
+    return ((int64_t) ggml_nbytes(t) + 63) / 64;
+}
+
 bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context* dev_ctx,
                              const ggml_tensor* rms_norm_node,
                              const ggml_tensor* mul_node) {
@@ -117,8 +176,10 @@ bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context* dev_ctx,
     params.dst  = *mul_node;               // final output
     params.eps  = eps;
 
+    // rms_norm_mul_f32 strides threads over ne[1] only (ne[2]/ne[3] are serial loops).
     bool kernel_result = ggml_et_launch_kernel(dev_ctx, "rms_norm_mul_f32",
-                                &params, sizeof(params), 0xFFFFFFFF);
+                                &params, sizeof(params),
+                                ggml_et_shire_mask_for(mul_node->ne[1]));
 
     ET_PERF_END_EXT("RMS_NORM_MUL", "rms_norm_mul_f32", mul_node, "eps=%.6f", (double)eps);
     return kernel_result;
@@ -154,7 +215,9 @@ bool ggml_et_op_scale(ggml_backend_et_device_context* dev_ctx, const ggml_tensor
     params.scale = scale;
     params.bias  = bias;
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "scale_f32", &params, sizeof(params), 0xFFFFFFFF);
+    // scale_f32 splits the output byte range into cache lines.
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "scale_f32", &params, sizeof(params),
+                                               ggml_et_shire_mask_for(ggml_et_cacheline_units(node)));
 
     ET_PERF_END_EXT("SCALE", "scale_f32", node, "scale=%.6f|bias=%.6f", (double)scale, (double)bias);
     return kernel_result;
@@ -216,7 +279,10 @@ bool ggml_et_op_elmap(ggml_backend_et_device_context* dev_ctx, const ggml_tensor
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "el_map_f32", &params, sizeof(params), 0xFFFFFFFF);
+    // el_map_f32 splits by cache line when rows < threads, otherwise by row.
+    // The cache-line count bounds both, so it never under-provisions shires.
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "el_map_f32", &params, sizeof(params),
+                                               ggml_et_shire_mask_for(ggml_et_cacheline_units(node)));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
@@ -285,7 +351,9 @@ bool ggml_et_op_glu(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* 
     }
 
     // Launch ET kernel
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "glu_f32", &params, sizeof(params), 0xFFFFFFFF);
+    // glu_f32 splits the output byte range into cache lines.
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "glu_f32", &params, sizeof(params),
+                                               ggml_et_shire_mask_for(ggml_et_cacheline_units(node)));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
@@ -378,6 +446,16 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         }
     }
 
+    // The scalar Q8_0 kernel deals one output row per hart, so M bounds its usable
+    // parallelism. Decode's K/V projections (M = n_embd_head * n_head_kv, e.g. 512
+    // for Llama 3.2 1B) leave most of a 32-shire launch idle. The matrix-engine
+    // variants tile over M/N themselves and keep the full mask.
+    const bool scalar_q8 = (node->src[0]->type == GGML_TYPE_Q8_0) &&
+                           (strcmp(kernel_name, "mul_mat_Q8_0") == 0);
+    const uint64_t mm_shire_mask = scalar_q8
+                                 ? ggml_et_shire_mask_for(node->src[0]->ne[1])
+                                 : ET_ALL_SHIRES;
+
     bool kernel_result;
     if (node->src[0]->type == GGML_TYPE_Q8_0) {
         // Both Q8_0 kernels take the extended struct; bias.data stays NULL (fused-add is out of scope here).
@@ -385,7 +463,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         q8_params.src0                 = params.src0;
         q8_params.src1                 = params.src1;
         q8_params.dst                  = params.dst;
-        kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &q8_params, sizeof(q8_params), 0xFFFFFFFF);
+        kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &q8_params, sizeof(q8_params), mm_shire_mask);
     } else {
         kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
     }
@@ -601,7 +679,9 @@ bool ggml_et_op_rope(ggml_backend_et_device_context* dev_ctx, const ggml_tensor*
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    // rope_f32 splits by (heads * seq_len * batch) = src0 ne[1]*ne[2]*ne[3].
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+        ggml_et_shire_mask_for(node->src[0]->ne[1] * node->src[0]->ne[2] * node->src[0]->ne[3]));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
@@ -663,7 +743,9 @@ bool ggml_et_op_rms_norm(ggml_backend_et_device_context* dev_ctx, const ggml_ten
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    // rms_norm_f32 strides threads over ne[1] only.
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+        ggml_et_shire_mask_for(node->ne[1]));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
@@ -697,8 +779,10 @@ bool ggml_et_op_norm(ggml_backend_et_device_context* dev_ctx, const ggml_tensor*
     params.dst = *node;
     params.eps = eps;
 
+    // norm_f32 strides threads over flattened rows ne[1]*ne[2]*ne[3].
     const bool result = ggml_et_launch_kernel(
-        dev_ctx, "norm_f32", &params, sizeof(params), 0xFFFFFFFF);
+        dev_ctx, "norm_f32", &params, sizeof(params),
+        ggml_et_shire_mask_for(node->ne[1] * node->ne[2] * node->ne[3]));
     ET_PERF_END_EXT("NORM", "norm_f32", node, "eps=%.6f", (double) eps);
     return result;
 }
@@ -726,8 +810,10 @@ bool ggml_et_op_unary(ggml_backend_et_device_context* dev_ctx, const ggml_tensor
     params.dst = *node;
     params.unary_op = (int32_t) unary_op;
 
+    // unary_f32 splits the output byte range into cache lines.
     const bool result = ggml_et_launch_kernel(
-        dev_ctx, "unary_f32", &params, sizeof(params), 0xFFFFFFFF);
+        dev_ctx, "unary_f32", &params, sizeof(params),
+        ggml_et_shire_mask_for(ggml_et_cacheline_units(node)));
     ET_PERF_END_EXT("UNARY", "unary_f32", node, "unary_op=%s", ggml_unary_op_name(unary_op));
     return result;
 }
@@ -870,7 +956,9 @@ bool ggml_et_op_softmax(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    // softmax_f32 strides threads over flattened rows ne[1]*ne[2]*ne[3].
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+        ggml_et_shire_mask_for(node->ne[1] * node->ne[2] * node->ne[3]));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
@@ -1026,7 +1114,9 @@ bool ggml_et_op_cont(ggml_backend_et_device_context* dev_ctx, const ggml_tensor*
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    // cont kernels split the output byte range into cache lines.
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+        ggml_et_shire_mask_for(ggml_et_cacheline_units(node)));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
@@ -1119,7 +1209,10 @@ bool ggml_et_op_set_rows(ggml_backend_et_device_context* dev_ctx, const ggml_ten
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    // set_rows_f32 fast path splits written rows into cache lines; the slow path
+    // splits by row, so the cache-line count never under-provisions.
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+        ggml_et_shire_mask_for(ggml_et_cacheline_units(node->src[0])));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {
