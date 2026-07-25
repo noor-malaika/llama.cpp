@@ -533,6 +533,67 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     abort();
 }
 
+// View-only ops occupy a node slot but compute nothing.
+static inline bool ggml_et_op_is_view(enum ggml_op op) {
+    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_NONE;
+}
+
+// Find a second SET_ROWS that can be fused with the one at index i, and return
+// its node index, or -1. The K-cache and V-cache writes of a decode layer are
+// independent, but the graph emits them as two nodes and view-only nodes may
+// sit between them, so this scans forward rather than assuming adjacency.
+static int ggml_et_match_set_rows_pair(const struct ggml_cgraph * cgraph, int i) {
+    if (!ggml_et_fuse_set_rows_enabled()) {
+        return -1;
+    }
+
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (first->op != GGML_OP_SET_ROWS) {
+        return -1;
+    }
+
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_et_op_is_view(cgraph->nodes[j]->op)) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_SET_ROWS) {
+        return -1;
+    }
+
+    const ggml_tensor * second = cgraph->nodes[j];
+
+    // The two copies run in one launch with no barrier between them, so they
+    // must not alias: neither may read what the other writes, and they must
+    // target different destinations.
+    for (int k = 0; k < GGML_MAX_SRC; k++) {
+        if (second->src[k] && second->src[k] == first) {
+            return -1;
+        }
+        if (first->src[k] && first->src[k] == second) {
+            return -1;
+        }
+    }
+    const ggml_tensor * da = first->view_src  ? first->view_src  : first;
+    const ggml_tensor * db = second->view_src ? second->view_src : second;
+    if (da == db) {
+        return -1;  // same underlying buffer; ordering would matter
+    }
+
+    // The fused kernel reuses set_rows_f32's own type checks, but both halves
+    // must be shapes it accepts.
+    if (first->src[0]->type != GGML_TYPE_F32 || second->src[0]->type != GGML_TYPE_F32 ||
+        first->src[1]->type != GGML_TYPE_I64 || second->src[1]->type != GGML_TYPE_I64) {
+        return -1;
+    }
+    if ((first->type != GGML_TYPE_F32 && first->type != GGML_TYPE_F16) ||
+        (second->type != GGML_TYPE_F32 && second->type != GGML_TYPE_F16)) {
+        return -1;
+    }
+
+    return j;
+}
+
 static bool ggml_et_can_fuse(const struct ggml_cgraph * cgraph, int node_idx,
                              std::initializer_list<enum ggml_op> ops) {
     // ggml_can_fuse() requires a chain -- each node a src of the next. The
@@ -691,6 +752,17 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
         }
 
         // --- Fusion checks (before regular dispatch) ---
+        // Two independent SET_ROWS (K cache + V cache) -> one launch.
+        {
+            const int second_idx = ggml_et_match_set_rows_pair(cgraph, i);
+            if (second_idx >= 0) {
+                if (ggml_et_op_set_rows_pair(dev_ctx, node, cgraph->nodes[second_idx])) {
+                    i = second_idx;
+                    continue;
+                }
+            }
+        }
+
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);
             i++;  // skip the MUL node

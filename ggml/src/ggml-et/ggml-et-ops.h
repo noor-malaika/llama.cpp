@@ -160,6 +160,13 @@ struct ggml_et_set_rows_params {
     ggml_tensor dst;      // F32/F16 destination tensor
 };
 
+// Two independent SET_ROWS fused into one launch. Must stay layout-identical
+// to ggml_et_set_rows_pair_params in et-kernels/src/set_rows_f32_pair.c.
+struct ggml_et_set_rows_pair_params {
+    ggml_et_set_rows_params a;
+    ggml_et_set_rows_params b;
+};
+
 struct ggml_et_rms_norm_mul_params {
     ggml_tensor src0;      // F32 input tensor (to be normalized)
     ggml_tensor src1;      // F32 weights tensor (element-wise multiply)
@@ -206,6 +213,12 @@ bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
                                 const ggml_tensor* gate_node,
                                 const ggml_tensor* up_node,
                                 const ggml_tensor* glu_node);
+bool ggml_et_fuse_set_rows_enabled();
+
+// Two independent SET_ROWS (K cache and V cache) in one launch.
+bool ggml_et_op_set_rows_pair(ggml_backend_et_device_context* dev_ctx,
+                              const ggml_tensor* first,
+                              const ggml_tensor* second);
 bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_rope(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
 bool ggml_et_op_rms_norm(ggml_backend_et_device_context* dev_ctx, const ggml_tensor* node);
