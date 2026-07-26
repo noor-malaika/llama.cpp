@@ -48,6 +48,7 @@ struct ggml_et_mm_q8_params {
     ggml_tensor bias;
     int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
     int32_t prefetch_dest;  // cache-op destination: 0 = L1, 1 = L2
+    int32_t use_regdot;     // 1 = register-blocked dot (lever B), 0 = per-block compute_block_dot_product_q8_0
 };
 
 // Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).
@@ -71,6 +72,13 @@ int32_t ggml_et_prefetch_rows();
 // each hart owns whole rows, so there is no sharing that justifies stopping
 // short of L1. GGML_ET_PREFETCH_DEST selects it.
 int32_t ggml_et_prefetch_dest();
+
+// Default off: register-blocked Q8_0 row dot (lever B), ported from
+// lever-b-register-dot (0a8556ac8). Defers the horizontal 8-lane reduction
+// from once-per-block to once-per-row instead of compute_block_dot_product_q8_0's
+// per-block reduction, and hoists the vector-mask setup out of the row loop.
+// Scalar mul_mat_Q8_0 kernel only.
+bool ggml_et_regdot_enabled();
 
 // Element map parameters for embarrassingly parallel binary operations (MUL, ADD, etc.)
 // Operation type is determined by dst->op (GGML_OP_MUL, GGML_OP_ADD, etc.)

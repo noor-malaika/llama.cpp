@@ -224,6 +224,7 @@ struct ggml_et_mm_q8_params {
     struct ggml_tensor bias;
     int32_t prefetch_rows;  // weight rows to prefetch ahead; 0 disables
     int32_t prefetch_dest;  // cache-op destination: 0 = L1, 1 = L2
+    int32_t use_regdot;     // 1 = register-blocked dot (lever B), 0 = per-block compute_block_dot_product_q8_0
 };
 
 // Fused SwiGLU feed-forward: dst = silu(gate x act) * (up x act).

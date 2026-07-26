@@ -226,6 +226,23 @@ static inline void * __attribute__((always_inline)) et_shire_l2scp_local(uint64_
     return (void *) (L2SCP_BASE | (L2SCP_SHIRE_LOCAL << 23) | (offset & 0x7FFFFF));
 }
 
+// Prefetch nlines (max 16, 4-bit field) cache lines at stride apart starting
+// at addr into L2 (not L1 - L1 is shared by both harts of a minion, so a
+// prefetch there tends to get evicted by the partner hart's own traffic
+// before it's consumed; L2 is large enough to hold a useful in-flight
+// prefetch window). Uses PrefetchVA (CSR 0x81f). Ported from lever-b-register-dot
+// (0a8556ac8) for the register-blocked Q8_0 dot product in block_ops.h.
+static inline void __attribute__((always_inline)) l2_prefetch(const void * addr, uint64_t nlines, uint64_t stride) {
+    uint64_t csr_val = (0x1ULL << 58) | ((uint64_t) addr & 0xFFFFFFFFFFC0ULL) | ((nlines - 1) & 0xF);
+
+    __asm__ __volatile__(
+        "mv    x31, %[stride]\n"
+        "csrw  0x81f, %[val]\n"
+        :
+        : [stride] "r"(stride & 0xFFFFFFFFFFC0ULL), [val] "r"(csr_val)
+        : "x31", "memory");
+}
+
 // Flushes nlines (max 16, 4-bit field) cache lines from L1 to L2 via FlushVA. Caller FENCEs before, WAIT_CACHEOPS after.
 static inline void __attribute__((always_inline)) flush_to_l2(const void * addr, uint64_t nlines, uint64_t stride) {
     uint64_t csr_val = (0x1ULL << 58) | ((uint64_t) addr & 0xFFFFFFFFFFC0ULL) | ((nlines - 1) & 0xF);

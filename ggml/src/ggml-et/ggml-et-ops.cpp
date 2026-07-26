@@ -174,6 +174,19 @@ bool ggml_et_fuse_set_rows_enabled() {
     return enabled;
 }
 
+// Default off: exploratory probe. Ported from lever-b-register-dot (0a8556ac8),
+// which was built on a separate, older lineage and never combined with the
+// launch-geometry/fusion/SET_ROWS work -- this wires it into the same kernel
+// so it can be measured stacked on top of everything else, gated so a single
+// build still A/Bs against the original per-block dot product.
+bool ggml_et_regdot_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_ET_REGDOT");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 // Default off: exploratory probe, see ggml-et-ops.h for the full rationale.
 bool ggml_et_packed_cont_enabled() {
     static const bool enabled = [] {
@@ -548,6 +561,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         q8_params.dst                  = params.dst;
         q8_params.prefetch_rows        = ggml_et_prefetch_rows();
         q8_params.prefetch_dest        = ggml_et_prefetch_dest();
+        q8_params.use_regdot           = scalar_q8 ? (ggml_et_regdot_enabled() ? 1 : 0) : 0;
         kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &q8_params, sizeof(q8_params), mm_shire_mask);
     } else {
         kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
@@ -631,6 +645,7 @@ bool ggml_et_op_mul_mat_add(ggml_backend_et_device_context* dev_ctx,
     q8_params.bias = *addend;
     q8_params.prefetch_rows = ggml_et_prefetch_rows();
     q8_params.prefetch_dest = ggml_et_prefetch_dest();
+    q8_params.use_regdot    = ggml_et_regdot_enabled() ? 1 : 0;
 
     // The kernel indexes bias with dst's strides, so the caller guarantees they
     // match (checked in ggml_et_can_fuse before we get here).

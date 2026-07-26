@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include "math_fp.h"
+#include "platform.h"
 #include "quants.h"
 
 //******************************************************************************
@@ -72,6 +73,96 @@ static inline float compute_block_dot_product_q8_0(const block_q8_0* a_block, co
 
     const float scale = fp16_to_fp32(a_block->d);
     return final_sum * scale;
+}
+
+//******************************************************************************
+// Q8_0 register-resident row dot (decode). compute_block_dot_product_q8_0
+// above returns to the caller once per 32-element block, so its horizontal
+// 8-lane reduction runs K_blocks times per row - most of that work is
+// redundant. Unlike an F32 row (no per-block scale, so a whole row's raw
+// products can share one accumulator with zero reduction until the very
+// end), a Q8_0 block's scale genuinely differs block to block, so the scale
+// multiply can't be deferred past its own block. What CAN be deferred: the
+// horizontal reduction itself. (sum over blocks of scale_kb * dot_kb[lane])
+// reassociates to (sum per lane across blocks, reduced once at the end) -
+// each block still gets its own scale multiply, but only one 8-lane
+// horizontal reduction happens per row instead of K_blocks of them.
+// Mask setup/restore is also hoisted out entirely - callers set the vector
+// mask once before the whole row loop (see mul_mat_Q8_0.c) instead of every
+// block, since nothing between blocks touches it.
+// Ported from lever-b-register-dot (0a8556ac8).
+//******************************************************************************
+
+// Zero the persistent per-lane accumulator (f24) for a new row.
+static inline void __attribute__((always_inline)) q8_0_dot_reset(void) {
+    __asm__ volatile("fbci.pi f24, 0\n" ::: "f24");
+}
+
+// Fold one Q8_0 block into the persistent accumulator. Caller must have
+// already set the vector mask to all 8 lanes (mov.m.x m0, x0, 0xFF).
+// Prefetches ahead into L2 every 8 blocks: the weight row is streamed once
+// and never reused, so L2 (not L1 - shared by both harts of a minion and
+// evicted before a same-minion prefetch would be consumed) is staged a fixed
+// distance ahead of the block this call consumes.
+static inline void __attribute__((always_inline))
+q8_0_dot_tile(const block_q8_0 * a_row, const float * b_col_start, int64_t kb, int64_t n_blocks) {
+    const int64_t PF_AHEAD = 16;
+    if ((kb & 7) == 0) {
+        const int64_t pf_block = kb + PF_AHEAD;
+        if (pf_block + 8 <= n_blocks) {
+            l2_prefetch(a_row + pf_block, 16, 64);   // 16 contiguous cache lines
+        }
+    }
+
+    const block_q8_0 * a_block = a_row + kb;
+
+    static const int32_t gather_pattern[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    __asm__ volatile("flw.ps f31, %[gather]\n" : : [gather] "m"(*(const int32_t(*)[8])gather_pattern) : "f31");
+    __asm__ volatile("fbci.pi f10, 0" ::: "f10");
+
+    for (int chunk = 0; chunk < 4; chunk++) {
+        int offset = chunk << 3;
+        __asm__ volatile(
+            "flw.ps f12, %[b_vec]\n"
+            "fgb.ps f11, f31(%[a_ptr])\n"
+            "fcvt.ps.pw f11, f11\n"
+            "fmadd.ps f10, f11, f12, f10\n"
+            :
+            : [a_ptr] "r"(&a_block->qs[offset]),
+              [b_vec] "m"(*(const float(*)[8])&b_col_start[offset])
+            : "f10", "f11", "f12"
+        );
+    }
+
+    // Scale this block's raw (not yet horizontally-reduced) 8-lane dot vector
+    // by its own fp16 scale, fold into the persistent per-lane accumulator.
+    uint32_t scale_raw = (uint32_t) a_block->d;
+    __asm__ volatile(
+        "fbcx.ps     f13, %[sb]         \n\t"
+        "fcvt.ps.f16 f13, f13           \n\t"
+        "fmadd.ps    f24, f10, f13, f24 \n\t"
+        :
+        : [sb] "r"(scale_raw)
+        : "f10", "f13", "f24"
+    );
+}
+
+// Horizontally reduce the persistent accumulator to a single float. Call
+// once per row, after every block has been folded in via q8_0_dot_tile.
+static inline float __attribute__((always_inline)) q8_0_dot_reduce(void) {
+    float result;
+    __asm__ __volatile__ (
+        "fswizz.ps f1, f24, 0xB1 \n\t"
+        "fadd.ps   f2, f24, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[vout], f4, f5, rne \n\t"
+        : [vout] "=f" (result)
+        :: "t0", "f1", "f2", "f3", "f4", "f5", "f24"
+    );
+    return result;
 }
 
 

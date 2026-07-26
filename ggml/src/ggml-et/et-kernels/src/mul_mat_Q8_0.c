@@ -161,6 +161,18 @@ int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
+    // Ported from lever-b-register-dot (0a8556ac8): the vector mask (all 8
+    // lanes) is the same for every block of every row of the whole call, so
+    // set it once here instead of once per block inside the dot product
+    // (q8_0_dot_tile no longer touches it). Gated by GGML_ET_REGDOT so a
+    // single build A/Bs against the unfused per-block compute_block_dot_product_q8_0.
+    const int32_t use_regdot = params->use_regdot;
+    unsigned long saved_mask = 0;
+    if (use_regdot) {
+        __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+        __asm__ volatile("mov.m.x m0, x0, 0xFF");
+    }
+
     for (int64_t i3 = 0; i3 < ne13; i3++) {
         const int64_t i03 = i3 / r3;
         const char* src0_ptr3 = (const char*)params->src0.data + i03 * nb03;
@@ -197,10 +209,19 @@ int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
                     const block_q8_0* q_row = (const block_q8_0*)(src0_ptr2 + m * nb01);
                     float sum = 0.0f;
 
-                    for (int64_t kb = 0; kb < K_blocks; kb++) {
-                        // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
-                        // b_col is float*, so we move 32 elements (kb << 5)
-                        sum += compute_block_dot_product_q8_0(q_row + kb, b_col_base + (kb << 5));
+                    if (use_regdot) {
+                        q8_0_dot_reset();
+                        for (int64_t kb = 0; kb < K_blocks; kb++) {
+                            // b_col is float*, so a block (32 elements) moves by (kb << 5)
+                            q8_0_dot_tile(q_row, b_col_base + (kb << 5), kb, K_blocks);
+                        }
+                        sum = q8_0_dot_reduce();
+                    } else {
+                        for (int64_t kb = 0; kb < K_blocks; kb++) {
+                            // q_row is a pointer to blocks, so + kb moves by sizeof(block_q8_0)
+                            // b_col is float*, so we move 32 elements (kb << 5)
+                            sum += compute_block_dot_product_q8_0(q_row + kb, b_col_base + (kb << 5));
+                        }
                     }
 
                     if (bias_ptr2) {
@@ -213,6 +234,10 @@ int entry_point(struct ggml_et_mm_q8_params* params, void* env) {
                 }
             }
         }
+    }
+
+    if (use_regdot) {
+        __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
     }
     return 0;
 }
