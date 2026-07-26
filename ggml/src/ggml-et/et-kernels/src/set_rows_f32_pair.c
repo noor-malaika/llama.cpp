@@ -18,10 +18,18 @@
 // each hart's cache-line ownership within a copy is unchanged.
 //******************************************************************************
 
-// Reuse set_rows_f32.c wholesale, renaming its entry point.
+// Reuse set_rows_f32.c wholesale, renaming its entry point. When this file is
+// compiled into the combined uberkernel.elf, the build already redefines
+// entry_point to a per-kernel unique name via -Dentry_point=<kernel>_entry
+// (see et-kernels/CMakeLists.txt); push/pop instead of #undef so that outer
+// rename survives the include instead of being destroyed by it -- an
+// unconditional #undef here would leave our own entry_point below literally
+// named "entry_point" in the uberkernel build, colliding with every other
+// kernel's identically-named (before renaming) symbol at link time.
+#pragma push_macro("entry_point")
 #define entry_point set_rows_run_one
 #include "set_rows_f32.c"
-#undef entry_point
+#pragma pop_macro("entry_point")
 
 // Must stay layout-identical to ggml_et_set_rows_pair_params in ggml-et-ops.h.
 struct ggml_et_set_rows_pair_params {
