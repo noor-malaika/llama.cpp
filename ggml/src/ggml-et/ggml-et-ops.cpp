@@ -174,6 +174,15 @@ bool ggml_et_fuse_set_rows_enabled() {
     return enabled;
 }
 
+// Default off: exploratory probe, see ggml-et-ops.h for the full rationale.
+bool ggml_et_packed_cont_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_ET_PACKED_CONT");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 // Default off: prefetching is a pure experiment until the board says otherwise,
 // and a wrong distance can evict the row being consumed.
 int32_t ggml_et_prefetch_rows() {
@@ -1272,20 +1281,36 @@ bool ggml_et_op_cont(ggml_backend_et_device_context* dev_ctx, const ggml_tensor*
         return false;
     }
 
-    // Select kernel based on type
+    // Select kernel based on type (+ the packed-params probe gate)
+    const bool use_packed = ggml_et_packed_cont_enabled();
     const char* kernel_name;
     if (node->type == GGML_TYPE_F32) {
-        kernel_name = "cont_f32";
+        kernel_name = use_packed ? "cont_f32_packed" : "cont_f32";
     } else if (node->type == GGML_TYPE_F16) {
-        kernel_name = "cont_f16";
+        kernel_name = use_packed ? "cont_f16_packed" : "cont_f16";
     } else {
         GGML_LOG_ERROR("ET: CONT operation with unsupported type: %s\n", ggml_type_name(node->type));
         return false;
     }
 
     ggml_et_cont_params params;
-    params.src0 = *node->src[0];  // Input tensor (potentially non-contiguous)
-    params.dst = *node;           // Output tensor (contiguous)
+    ggml_et_cont_params_packed packed_params;
+    void* launch_params = &params;
+    size_t launch_params_size = sizeof(params);
+    if (use_packed) {
+        packed_params.src0_data = node->src[0]->data;
+        packed_params.dst_data  = node->data;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            packed_params.ne[i] = node->src[0]->ne[i];
+            packed_params.nb[i] = node->src[0]->nb[i];
+        }
+        packed_params.type = (int32_t) node->type;
+        launch_params = &packed_params;
+        launch_params_size = sizeof(packed_params);
+    } else {
+        params.src0 = *node->src[0];  // Input tensor (potentially non-contiguous)
+        params.dst = *node;           // Output tensor (contiguous)
+    }
 
     // Phase 1: Initialize CPU comparison context and copy source buffers (before ET kernel)
     ggml_et_cpu_compare_ctx cpu_cmp_ctx;
@@ -1299,7 +1324,7 @@ bool ggml_et_op_cont(ggml_backend_et_device_context* dev_ctx, const ggml_tensor*
     }
 
     // cont kernels split the output byte range into cache lines.
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, launch_params, launch_params_size,
         ggml_et_shire_mask_for(ggml_et_cacheline_units(node)));
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)

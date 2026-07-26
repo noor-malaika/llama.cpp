@@ -47,6 +47,8 @@ set(KERNELS
     get_rows_f32
     cont_f32
     cont_f16
+    cont_f32_packed
+    cont_f16_packed
     set_rows_f32
     set_rows_f32_pair
     memops

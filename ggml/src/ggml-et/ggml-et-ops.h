@@ -162,6 +162,22 @@ struct ggml_et_cont_params {
     ggml_tensor dst;      // F32 output tensor (contiguous)
 };
 
+// Minimal CONT params: only the fields cont_f32.c/cont_f16.c actually read
+// from src0/dst (data pointer, ne, nb; dst needs only its data pointer).
+// 88 bytes vs ggml_et_cont_params's 672 -- fits under the 128-byte
+// DEVICE_OPS_KERNEL_LAUNCH_ARGS_PAYLOAD_MAX, so the runtime embeds it
+// directly instead of taking the oversized-args slow path (extra CMA alloc
+// + host->device DMA + forced barrier -- see KernelLaunch.cpp doKernelLaunch).
+// Must stay layout-identical to ggml_et_cont_params_packed in
+// et-kernels/src/cont_f32.c and cont_f16.c.
+struct ggml_et_cont_params_packed {
+    void*   src0_data;
+    void*   dst_data;
+    int64_t ne[4];   // src0 ne
+    int64_t nb[4];   // src0 nb
+    int32_t type;    // GGML_TYPE_F32 or GGML_TYPE_F16, for the kernel's existing safety check
+};
+
 struct ggml_et_set_rows_params {
     ggml_tensor src0;     // F32 source data tensor
     ggml_tensor src1;     // I64 row indices tensor
@@ -222,6 +238,15 @@ bool ggml_et_op_mul_mat_ffn_glu(ggml_backend_et_device_context* dev_ctx,
                                 const ggml_tensor* up_node,
                                 const ggml_tensor* glu_node);
 bool ggml_et_fuse_set_rows_enabled();
+
+// Default off: exploratory probe for whether shrinking launch params under
+// the 128-byte embedding limit (DEVICE_OPS_KERNEL_LAUNCH_ARGS_PAYLOAD_MAX)
+// measurably cuts per-launch host enqueue cost. Selects cont_f32_packed /
+// cont_f16_packed (88-byte params) over cont_f32 / cont_f16 (672-byte, full
+// ggml_tensor copies -- takes the runtime's oversized-args slow path: extra
+// CMA alloc, host->device DMA, forced barrier). See KernelLaunch.cpp
+// doKernelLaunch for the exact slow-path mechanism this bypasses.
+bool ggml_et_packed_cont_enabled();
 
 // Two independent SET_ROWS (K cache and V cache) in one launch.
 bool ggml_et_op_set_rows_pair(ggml_backend_et_device_context* dev_ctx,
