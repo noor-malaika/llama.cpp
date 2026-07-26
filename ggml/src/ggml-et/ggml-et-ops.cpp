@@ -2447,6 +2447,43 @@ bool ggml_et_op_set_rows(ggml_backend_et_device_context * dev_ctx, const ggml_te
     return kernel_result;
 }
 
+static bool ggml_et_env_flag_default_on(const char * name) {
+    const char * v = getenv(name);
+    return !(v && v[0] == '0');
+}
+
+bool ggml_et_fuse_set_rows_enabled() {
+    static const bool enabled = ggml_et_env_flag_default_on("GGML_ET_FUSE_SET_ROWS");
+    return enabled;
+}
+
+// Fuse the K-cache and V-cache SET_ROWS of a decode layer into one launch.
+// They are independent, so the kernel simply performs both copies; each hart
+// takes its share of the first and then its share of the second.
+bool ggml_et_op_set_rows_pair(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * first,
+                              const ggml_tensor * second) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !first || !second ||
+        !first->src[0] || !first->src[1] || !second->src[0] || !second->src[1]) {
+        GGML_LOG_ERROR("ET: Invalid parameters for fused SET_ROWS pair\n");
+        return false;
+    }
+
+    ggml_et_set_rows_pair_params params;
+    params.a.src0 = *first->src[0];
+    params.a.src1 = *first->src[1];
+    params.a.dst  = *first;
+    params.b.src0 = *second->src[0];
+    params.b.src1 = *second->src[1];
+    params.b.dst  = *second;
+
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "set_rows_f32_pair", &params, sizeof(params), 0xFFFFFFFF);
+
+    ET_PERF_END_EXT("SET_ROWS_PAIR", "set_rows_f32_pair", first, "paired_with=%s", second->name);
+    return kernel_result;
+}
+
 bool ggml_et_op_fill(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
     ET_PERF_START();
 

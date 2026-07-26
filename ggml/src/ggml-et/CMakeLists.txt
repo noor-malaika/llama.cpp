@@ -75,6 +75,7 @@ set(KERNELS
     cpy_f32_f16
     flash_attn_ext_f16_me
     set_rows_f32
+    set_rows_f32_pair
     set_f32
     fill_f32
     pad_f32
@@ -130,6 +131,7 @@ set(UBERKERNEL_SUPPORTED_KERNELS
     scale_f32
     set_f32
     set_rows_f32
+    set_rows_f32_pair
     softmax_f32
     solve_tri_f32
     sqr_f32
