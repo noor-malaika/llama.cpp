@@ -13,6 +13,7 @@ struct ggml_et_rms_norm_params;
 struct ggml_et_rms_norm_mul_params;
 struct ggml_et_softmax_params;
 struct ggml_et_set_rows_params;
+struct ggml_et_set_rows_pair_params;
 struct ggml_et_get_rows_params;
 struct ggml_et_cont_params;
 struct ggml_et_concat_params;
@@ -47,6 +48,7 @@ extern int rms_norm_f32_entry(struct ggml_et_rms_norm_params *, void *);
 extern int rms_norm_mul_f32_entry(struct ggml_et_rms_norm_mul_params *, void *);
 extern int softmax_f32_entry(struct ggml_et_softmax_params *, void *);
 extern int set_rows_f32_entry(struct ggml_et_set_rows_params *, void *);
+extern int set_rows_f32_pair_entry(struct ggml_et_set_rows_pair_params *, void *);
 extern int get_rows_f32_entry(struct ggml_et_get_rows_params *, void *);
 extern int cont_f32_entry(struct ggml_et_cont_params *, void *);
 extern int cont_f16_entry(struct ggml_et_cont_params *, void *);
@@ -313,6 +315,11 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             case GGML_ET_UBERKERNEL_KERNEL_SET_ROWS_F32:
                 {
                     rc = set_rows_f32_entry((struct ggml_et_set_rows_params *) inst_params, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_SET_ROWS_F32_PAIR:
+                {
+                    rc = set_rows_f32_pair_entry((struct ggml_et_set_rows_pair_params *) inst_params, env);
                     break;
                 }
 
