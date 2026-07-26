@@ -266,7 +266,12 @@ struct common_params_model {
 struct common_ngram_mod;
 
 struct common_params_speculative {
-    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
+    // ET-SoC1: default to draft-model-free n-gram lookup decoding. Verifies
+    // drafted tokens in a batched pass instead of one launch per token, which
+    // amortizes this backend's fixed per-launch host overhead. Benefit scales
+    // with how self-repetitive the generated text is; pass --spec-type none
+    // to restore standard token-by-token decoding.
+    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE; // type of speculative decoding
 
     // general-purpose speculative decoding parameters
 
